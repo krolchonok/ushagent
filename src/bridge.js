@@ -29,6 +29,22 @@ const SETUP_MODE_MANUAL = 'manual_fallback';
 const ATTACHMENT_DOWNLOAD_DIR = path.join(os.tmpdir(), 'ushagent-files');
 const DICTATION_HINT_TEXT = 'Hint: for voice input, use your phone keyboard dictation.';
 const MAX_CONVERSATION_HISTORY = 40;
+const TELEGRAM_BOT_COMMANDS = Object.freeze([
+  { command: 'help', description: 'Show available commands' },
+  { command: 'menu', description: 'Open the control panel' },
+  { command: 'status', description: 'Show current bridge status' },
+  { command: 'new', description: 'Start a fresh session on next prompt' },
+  { command: 'session', description: 'Show current session binding' },
+  { command: 'sessions', description: 'List sessions for current project' },
+  { command: 'resume', description: 'Resume a saved or listed session' },
+  { command: 'project', description: 'Switch or inspect the active project' },
+  { command: 'projects', description: 'List known projects' },
+  { command: 'usage', description: 'Show Codex usage status' },
+  { command: 'history', description: 'Show recent session messages' },
+  { command: 'prev', description: 'Show the latest session message' },
+  { command: 'last', description: 'Show the last completed exchange' },
+  { command: 'stop', description: 'Stop current execution and clear queue' },
+]);
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -125,6 +141,10 @@ function normalizeTelegramCommand(rawCommand) {
 
 function formatHistoryTimestamp(value) {
   return new Date(value).toLocaleTimeString();
+}
+
+function getTelegramBotCommands() {
+  return TELEGRAM_BOT_COMMANDS.map(command => ({ ...command }));
 }
 
 class Bridge {
@@ -1349,6 +1369,7 @@ class Bridge {
     try {
       await telegram.ensurePollingMode();
       const me = await telegram.getMe();
+      await telegram.setMyCommands(getTelegramBotCommands());
 
       const nextBotId = me.id === undefined || me.id === null ? null : String(me.id);
       const nextBotUsername = me.username || null;

@@ -273,6 +273,23 @@ class TelegramApi {
     }
   }
 
+  async setMyCommands(commands = []) {
+    const normalizedCommands = Array.isArray(commands)
+      ? commands
+          .map(command => ({
+            command: String(command?.command || '').trim(),
+            description: String(command?.description || '').trim(),
+          }))
+          .filter(command => command.command && command.description)
+      : [];
+
+    try {
+      await this.bot.setMyCommands(normalizedCommands);
+    } catch (error) {
+      throw toTelegramError(error, 'Failed to register Telegram bot commands');
+    }
+  }
+
   async getUpdates(cursor, timeout = 20) {
     const opts = {
       timeout: Number.isFinite(timeout) ? Math.max(1, Math.min(50, timeout)) : 20,

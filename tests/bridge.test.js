@@ -4,6 +4,7 @@ import path from 'node:path';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import test from 'node:test';
 import Bridge from '../src/bridge.js';
+import { TelegramApi } from '../src/telegram-api.js';
 
 class FakeConfig {
   constructor() {
@@ -52,6 +53,20 @@ class FakeConfig {
   setActiveWorkspace(workspacePath) {
     this._data.activeWorkspacePath = workspacePath;
     return this._data;
+  }
+
+  clearPairing(options = {}) {
+    this._data.telegramChatId = null;
+    this._data.telegramChatUserId = null;
+    this._data.telegramControlPanelMessageId = null;
+    if (options.keepBotToken !== true) {
+      this._data.telegramBotToken = null;
+    }
+    return this._data;
+  }
+
+  getStoredTelegramBotToken() {
+    return this._data.telegramBotToken;
   }
 
   get provider() {
@@ -382,6 +397,42 @@ test('handleCommand /history returns recent chat history', async () => {
 
     rmSync(fixturePath, { force: true });
   } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('connectToken registers Telegram bot commands during initialization', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  const originalEnsurePollingMode = TelegramApi.prototype.ensurePollingMode;
+  const originalGetMe = TelegramApi.prototype.getMe;
+  const originalSetMyCommands = TelegramApi.prototype.setMyCommands;
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    let registeredCommands = null;
+
+    TelegramApi.prototype.ensurePollingMode = async () => {};
+    TelegramApi.prototype.getMe = async () => ({ id: 999, username: 'freshbot' });
+    TelegramApi.prototype.setMyCommands = async commands => {
+      registeredCommands = commands;
+    };
+
+    const connected = await bridge.connectToken('123456:token_token_token_token');
+
+    assert.equal(connected, true);
+    assert.ok(Array.isArray(registeredCommands));
+    assert.deepEqual(
+      registeredCommands.map(command => command.command),
+      ['help', 'menu', 'status', 'new', 'session', 'sessions', 'resume', 'project', 'projects', 'usage', 'history', 'prev', 'last', 'stop']
+    );
+    assert.equal(config.telegramBotUsername, 'freshbot');
+  } finally {
+    TelegramApi.prototype.ensurePollingMode = originalEnsurePollingMode;
+    TelegramApi.prototype.getMe = originalGetMe;
+    TelegramApi.prototype.setMyCommands = originalSetMyCommands;
     process.chdir(previousCwd);
   }
 });

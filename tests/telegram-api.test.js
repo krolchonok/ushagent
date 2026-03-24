@@ -31,3 +31,25 @@ test('sendMessage uses HTML parse mode for Telegram formatting', async () => {
   assert.equal(request.options.parse_mode, 'HTML');
   assert.match(request.text, /Run <code>npm test<\/code>/);
 });
+
+test('setMyCommands passes normalized commands to Telegram', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  let request = null;
+  api.bot = {
+    setMyCommands: async commands => {
+      request = commands;
+      return true;
+    },
+  };
+
+  await api.setMyCommands([
+    { command: 'help', description: 'Show help' },
+    { command: ' status ', description: ' Show status ' },
+    { command: '', description: 'skip' },
+  ]);
+
+  assert.deepEqual(request, [
+    { command: 'help', description: 'Show help' },
+    { command: 'status', description: 'Show status' },
+  ]);
+});
