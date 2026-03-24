@@ -40,8 +40,8 @@ ushagent --version
 Optional: put the Telegram bot token into the current project `.env`:
 
 ```bash
-cp .env.example .env
-$EDITOR .env
+Copy .env.example to .env
+Edit .env
 ```
 
 Supported variables:
@@ -152,4 +152,5 @@ Any regular text message is forwarded to the active agent.
 - If no startup flag is passed, `ushagent codex` resumes the latest session by default.
 - Attachments from Telegram are forwarded to the active provider.
 - On Linux, `ushagent service install` sets up one global `systemd` user service and asks whether to enable startup, whether to start now, and whether to enable reboot persistence via `linger`.
+- On Windows, `ushagent service` is unavailable; use a normal terminal session or wrap `ushagent codex` with Task Scheduler/NSSM.
 - The service restores the last active project from `~/.ushagent/config.json`, and you can switch projects later with `/project`.

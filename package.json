@@ -12,7 +12,7 @@
     "hely": "./bin/hey.js"
   },
   "scripts": {
-    "start": "./bin/hey.js",
+    "start": "node ./bin/hey.js",
     "dev:watch:codex": "node --watch --watch-path=src --watch-path=bin --watch-preserve-output ./bin/hey.js codex",
     "dev:watch:status": "node --watch --watch-path=src --watch-path=bin --watch-preserve-output ./bin/hey.js status",
     "test": "node --test",
@@ -22,8 +22,8 @@
     "format:check": "prettier --check .",
     "check": "npm run lint && npm run format:check",
     "pack": "npm pack",
-    "pack:install": "npm pack && npm install -g ushagent-*.tgz",
-    "pack:test": "npm pack && mkdir -p .tmp && cd .tmp && npm init -y && npm install ../ushagent-*.tgz && ./node_modules/.bin/ushagent --version",
+    "pack:install": "npm pack && node ./scripts/install-packed-cli.js",
+    "pack:test": "npm pack && node ./scripts/verify-packed-cli.js",
     "version:patch": "npm version patch",
     "version:minor": "npm version minor",
     "version:major": "npm version major",

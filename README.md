@@ -19,8 +19,8 @@ npm install -g ushagent
 
 ```bash
 # Optional: store Telegram bot token in project .env
-cp .env.example .env
-$EDITOR .env
+Copy .env.example to .env
+Edit .env
 
 # Resume latest session (default)
 ushagent codex
@@ -94,7 +94,7 @@ Manual fallback avoids tunneling completely:
 3. CLI shows bot opening link/QR for pairing.
 
 If recommended phone onboarding fails in your environment, install system `cloudflared`
-(for example `brew install cloudflared`) or choose manual fallback.
+(for example `brew install cloudflared` on macOS or `winget install Cloudflare.cloudflared` on Windows) or choose manual fallback.
 
 ## Security Notes
 
@@ -179,6 +179,8 @@ During `install`, UshAgent asks whether to:
 - enable `linger` so the service starts after reboot even before login
 
 The service restores the last active project from `~/.ushagent/config.json`, and you can switch projects later from Telegram with `/project`.
+
+On Windows, `ushagent service ...` is not available. Run `ushagent codex` in a terminal or register it with Task Scheduler/NSSM if you need background startup.
 
 ## Notes
 
