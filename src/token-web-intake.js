@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const BOTFATHER_URL = 'https://t.me/BotFather';
+const SESSION_SECRET_HEADER = 'x-ushagent-session-secret';
 
 function escapeHtml(value) {
   return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -151,7 +152,7 @@ function renderOnboardingPage(basePath) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HeyAgent Setup</title>
+  <title>UshAgent Setup</title>
   <style>
     :root {
       --bg: #f8fafc;
@@ -257,7 +258,7 @@ function renderOnboardingPage(basePath) {
 <body>
   <main class="wrap">
     <header class="head">
-      <h1 class="title">HeyAgent Setup</h1>
+      <h1 class="title">UshAgent Setup</h1>
       <p class="sub">One-time onboarding on this device</p>
       <div class="dots">
         <div id="dot0" class="dot active"></div>
@@ -305,6 +306,7 @@ function renderOnboardingPage(basePath) {
 
   <script>
     const BASE = ${basePathJson};
+    const sessionSecret = window.location.hash ? window.location.hash.slice(1) : '';
     const state = {
       tokenStatus: 'waiting',
       tokenMessage: '',
@@ -390,8 +392,15 @@ function renderOnboardingPage(basePath) {
     }
 
     async function pollState() {
+      if (!sessionSecret) {
+        setMessage(byId('tokenMsg'), 'Session secret is missing. Re-open the QR link from terminal.', 'err');
+        return;
+      }
       try {
-        const res = await fetch(BASE + '/api/state', { cache: 'no-store' });
+        const res = await fetch(BASE + '/api/state', {
+          cache: 'no-store',
+          headers: { '${SESSION_SECRET_HEADER}': sessionSecret },
+        });
         if (!res.ok) return;
         const data = await res.json();
         updateFromState(data);
@@ -431,7 +440,10 @@ function renderOnboardingPage(basePath) {
       try {
         const res = await fetch(BASE + '/api/token', {
           method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          headers: {
+            'content-type': 'application/x-www-form-urlencoded',
+            '${SESSION_SECRET_HEADER}': sessionSecret,
+          },
           body: new URLSearchParams({ token: tokenValue }),
         });
 
@@ -467,6 +479,7 @@ async function createOnboardingSession(options = {}) {
   const onReady = typeof options.onReady === 'function' ? options.onReady : null;
 
   const sessionId = crypto.randomBytes(18).toString('hex');
+  const sessionSecret = crypto.randomBytes(18).toString('hex');
   const basePath = `/${sessionId}`;
   const state = {
     tokenStatus: 'waiting',
@@ -520,6 +533,13 @@ async function createOnboardingSession(options = {}) {
     const htmlPath = url.pathname === basePath || url.pathname === `${basePath}/`;
     const statePath = url.pathname === `${basePath}/api/state`;
     const tokenPath = url.pathname === `${basePath}/api/token`;
+    const sessionHeader = String(req.headers[SESSION_SECRET_HEADER] || '').trim();
+
+    if ((statePath || tokenPath) && sessionHeader !== sessionSecret) {
+      res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'Invalid onboarding session secret.' }));
+      return;
+    }
 
     if (req.method === 'GET' && htmlPath) {
       res.writeHead(200, {
@@ -603,7 +623,7 @@ async function createOnboardingSession(options = {}) {
         });
 
     const baseTunnelUrl = await waitForTryCloudflareUrl(cloudflared, timeoutMs);
-    tunnelUrl = `${baseTunnelUrl}${basePath}`;
+    tunnelUrl = `${baseTunnelUrl}${basePath}#${sessionSecret}`;
 
     if (onReady) {
       onReady(tunnelUrl);

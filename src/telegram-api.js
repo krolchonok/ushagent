@@ -38,6 +38,53 @@ function splitMessage(text) {
   return chunks;
 }
 
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function formatInlineCode(text) {
+  return escapeHtml(text).replace(/`([^`\n]+)`/g, '<code>$1</code>');
+}
+
+function formatTelegramHtml(text) {
+  const normalized = normalizeText(text);
+  const parts = [];
+  const codeBlockPattern = /```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g;
+  let lastIndex = 0;
+
+  for (const match of normalized.matchAll(codeBlockPattern)) {
+    const matchIndex = Number.isInteger(match.index) ? match.index : -1;
+    if (matchIndex < 0) {
+      continue;
+    }
+
+    const plainText = normalized.slice(lastIndex, matchIndex);
+    if (plainText) {
+      parts.push(formatInlineCode(plainText));
+    }
+
+    const language = String(match[1] || '').trim();
+    const code = escapeHtml(match[2] || '');
+    if (language) {
+      parts.push(`<pre><code class="language-${language}">${code}</code></pre>`);
+    } else {
+      parts.push(`<pre>${code}</pre>`);
+    }
+
+    lastIndex = matchIndex + match[0].length;
+  }
+
+  const tail = normalized.slice(lastIndex);
+  if (tail) {
+    parts.push(formatInlineCode(tail));
+  }
+
+  return parts.join('') || 'No response.';
+}
+
 function extractStatusCode(error) {
   if (typeof error?.response?.statusCode === 'number') {
     return error.response.statusCode;
@@ -172,6 +219,31 @@ function normalizeMessage(update) {
   };
 }
 
+function normalizeCallbackQuery(update) {
+  const callbackQuery = update?.callback_query;
+  if (!callbackQuery) {
+    return null;
+  }
+
+  const message = callbackQuery.message;
+  return {
+    updateId: Number.isInteger(update.update_id) ? update.update_id : null,
+    callbackQueryId: typeof callbackQuery.id === 'string' ? callbackQuery.id : null,
+    messageId: Number.isInteger(message?.message_id) ? message.message_id : null,
+    chatId: message?.chat?.id === undefined || message?.chat?.id === null ? null : String(message.chat.id),
+    chatType: typeof message?.chat?.type === 'string' ? message.chat.type : null,
+    userId: callbackQuery.from?.id === undefined || callbackQuery.from?.id === null ? null : String(callbackQuery.from.id),
+    type: 'callback',
+    text: typeof callbackQuery.data === 'string' ? callbackQuery.data.trim() : '',
+    data: typeof callbackQuery.data === 'string' ? callbackQuery.data.trim() : '',
+    fileId: null,
+    fileName: null,
+    mimeType: null,
+    fileSizeBytes: null,
+    durationSec: null,
+  };
+}
+
 class TelegramApi {
   constructor(token) {
     this.token = token;
@@ -204,7 +276,7 @@ class TelegramApi {
   async getUpdates(cursor, timeout = 20) {
     const opts = {
       timeout: Number.isFinite(timeout) ? Math.max(1, Math.min(50, timeout)) : 20,
-      allowed_updates: ['message'],
+      allowed_updates: ['message', 'callback_query'],
     };
 
     if (Number.isFinite(cursor) && cursor >= 0) {
@@ -224,6 +296,12 @@ class TelegramApi {
         const normalized = normalizeMessage(update);
         if (normalized) {
           messages.push(normalized);
+          continue;
+        }
+
+        const normalizedCallback = normalizeCallbackQuery(update);
+        if (normalizedCallback) {
+          messages.push(normalizedCallback);
         }
       }
 
@@ -233,7 +311,7 @@ class TelegramApi {
     }
   }
 
-  async sendMessage(chatId, text) {
+  async sendMessage(chatId, text, options = {}) {
     const targetChatId = String(chatId || '').trim();
     if (!targetChatId) {
       throw new TelegramApiError('Missing Telegram chat ID');
@@ -241,11 +319,59 @@ class TelegramApi {
 
     const chunks = splitMessage(text);
     try {
-      for (const chunk of chunks) {
-        await this.bot.sendMessage(targetChatId, chunk);
+      let lastMessage = null;
+      for (let index = 0; index < chunks.length; index += 1) {
+        const chunk = chunks[index];
+        const requestOptions = {
+          parse_mode: 'HTML',
+        };
+        if (index === chunks.length - 1 && options.replyMarkup) {
+          requestOptions.reply_markup = options.replyMarkup;
+        }
+        lastMessage = await this.bot.sendMessage(targetChatId, formatTelegramHtml(chunk), requestOptions);
       }
+      return lastMessage;
     } catch (error) {
       throw toTelegramError(error, 'Failed to send Telegram message');
+    }
+  }
+
+  async answerCallbackQuery(callbackQueryId, text = '') {
+    const normalizedId = String(callbackQueryId || '').trim();
+    if (!normalizedId) {
+      throw new TelegramApiError('Missing Telegram callback query ID');
+    }
+
+    try {
+      await this.bot.answerCallbackQuery(normalizedId, text ? { text } : {});
+    } catch (error) {
+      throw toTelegramError(error, 'Failed to answer Telegram callback query');
+    }
+  }
+
+  async editMessageText(chatId, messageId, text, options = {}) {
+    const targetChatId = String(chatId || '').trim();
+    if (!targetChatId) {
+      throw new TelegramApiError('Missing Telegram chat ID');
+    }
+
+    if (!Number.isInteger(messageId)) {
+      throw new TelegramApiError('Missing Telegram message ID');
+    }
+
+    try {
+      return await this.bot.editMessageText(formatTelegramHtml(text), {
+        chat_id: targetChatId,
+        message_id: messageId,
+        parse_mode: 'HTML',
+        reply_markup: options.replyMarkup || undefined,
+      });
+    } catch (error) {
+      const message = String(error?.message || '');
+      if (/message is not modified/i.test(message)) {
+        return null;
+      }
+      throw toTelegramError(error, 'Failed to edit Telegram message');
     }
   }
 
@@ -268,4 +394,4 @@ class TelegramApi {
   }
 }
 
-export { TelegramApi, TelegramApiError };
+export { TelegramApi, TelegramApiError, formatTelegramHtml };

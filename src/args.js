@@ -14,18 +14,6 @@ export function hasFlag(providerArgs, longName, shortName = null) {
 export function applyDefaultBypassArgs(provider, providerArgs) {
   const args = Array.isArray(providerArgs) ? [...providerArgs] : [];
 
-  if (provider === 'claude') {
-    const hasExplicitPermissionMode =
-      hasFlag(args, '--permission-mode') || hasFlag(args, '--dangerously-skip-permissions') || hasFlag(args, '--allow-dangerously-skip-permissions');
-
-    if (!hasExplicitPermissionMode) {
-      args.unshift('--dangerously-skip-permissions');
-      return { providerArgs: args, defaultBypassApplied: true };
-    }
-
-    return { providerArgs: args, defaultBypassApplied: false };
-  }
-
   if (provider === 'codex') {
     const hasExplicitPermissionMode =
       hasFlag(args, '--dangerously-bypass-approvals-and-sandbox') ||

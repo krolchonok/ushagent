@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,16 +11,24 @@ import qrcode from 'qrcode-terminal';
 import Logger from './logger.js';
 import { TelegramApi, TelegramApiError } from './telegram-api.js';
 import { createOnboardingSession } from './token-web-intake.js';
-import { runClaudePrompt } from './providers/claude-provider.js';
-import { runCodexPrompt } from './providers/codex-provider.js';
 import { applyDefaultBypassArgs } from './args.js';
 import { formatSleepInhibitorStatus, startSleepInhibitor } from './sleep-inhibitor.js';
+import { createAttachmentHandler } from './attachment-handler.js';
+import { collectKnownWorkspaces, formatWorkspaceList } from './workspace-manager.js';
+import { fetchCodexUsage, formatCodexUsage } from './providers/codex-usage.js';
+import {
+  createProviderRuntime,
+  formatProviderName,
+  getProviderSessionId,
+  setProviderSessionId,
+} from './providers/provider-registry.js';
 
 const BOTFATHER_URL = 'https://t.me/BotFather';
 const SETUP_MODE_PHONE = 'phone_onboarding';
 const SETUP_MODE_MANUAL = 'manual_fallback';
-const ATTACHMENT_DOWNLOAD_DIR = path.join(os.tmpdir(), 'heyagent-files');
+const ATTACHMENT_DOWNLOAD_DIR = path.join(os.tmpdir(), 'ushagent-files');
 const DICTATION_HINT_TEXT = 'Hint: for voice input, use your phone keyboard dictation.';
+const MAX_CONVERSATION_HISTORY = 40;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -35,33 +44,6 @@ async function promptLine(question) {
   }
 }
 
-function getCurrentSessionId(config, provider) {
-  if (provider === 'codex') {
-    return config.codexLastSessionId || null;
-  }
-  if (provider === 'claude') {
-    return config.claudeLastSessionId || null;
-  }
-  return null;
-}
-
-function splitArgs(raw) {
-  return String(raw || '')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-}
-
-function formatProviderName(provider) {
-  if (provider === 'claude') {
-    return 'Claude';
-  }
-  if (provider === 'codex') {
-    return 'Codex';
-  }
-  return String(provider || 'Provider');
-}
-
 function makePairCode() {
   while (true) {
     const code = crypto
@@ -74,20 +56,23 @@ function makePairCode() {
   }
 }
 
-function buildStatusText(config, provider, providerArgs = [], sleepInhibitorState = null) {
+function buildStatusText(config, provider, providerArgs = [], sleepInhibitorState = null, attachmentStatus = null) {
   const bot = config.telegramBotUsername ? `@${config.telegramBotUsername}` : 'not set';
-  const sessionId = getCurrentSessionId(config, provider);
+  const sessionId = getProviderSessionId(config, provider);
   const argsText = Array.isArray(providerArgs) && providerArgs.length > 0 ? providerArgs.join(' ') : '(none)';
   const sleepStatus = formatSleepInhibitorStatus(sleepInhibitorState);
   return [
     `Provider: ${provider}`,
     `Args: ${argsText}`,
     `Sleep prevention: ${sleepStatus}`,
+    attachmentStatus ? `Voice transcription: ${attachmentStatus}` : null,
     `Directory: ${process.cwd()}`,
     `Bot: ${bot}`,
     `Chat: ${config.telegramChatId || 'not paired'}`,
     `Session: ${sessionId || '-'}`,
-  ].join('\n');
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function isPairStartMessage(text, code) {
@@ -128,6 +113,20 @@ function toLogPreview(text) {
   return `${singleLine.slice(0, 239)}…`;
 }
 
+function normalizeTelegramCommand(rawCommand) {
+  const value = String(rawCommand || '').trim().toLowerCase();
+  if (!value.startsWith('/')) {
+    return value;
+  }
+
+  const mentionIndex = value.indexOf('@');
+  return mentionIndex > 0 ? value.slice(0, mentionIndex) : value;
+}
+
+function formatHistoryTimestamp(value) {
+  return new Date(value).toLocaleTimeString();
+}
+
 class Bridge {
   constructor(config, provider, providerArgs = [], options = {}) {
     this.config = config;
@@ -135,9 +134,11 @@ class Bridge {
     this.providerArgs = providerArgs;
     this.initialSessionId = String(options.initialSessionId || '').trim() || null;
     this.startMode = options.startMode === 'new' ? 'new' : options.startMode === 'resume' ? 'resume' : 'auto';
-    this.forceNewNextPrompt = this.startMode === 'new';
+    this.sessionMode = this.startMode === 'new' ? 'new' : 'latest';
+    this.forceNewNextPrompt = this.sessionMode === 'new';
     this.logger = new Logger('bridge');
     this.telegram = null;
+    this.attachmentHandler = null;
     this.sleepInhibitorState = null;
     this.running = true;
     this.manualHelpShown = false;
@@ -149,13 +150,21 @@ class Bridge {
     this.activePromptAbortReason = null;
     this.telegramPendingMessages = [];
     this.telegramDispatchScheduled = false;
+    this.resumeListCache = {
+      provider: null,
+      sessionIds: [],
+    };
+    this.projectListCache = [];
+    this.cachedUsageSnapshot = null;
+    this.lastExchange = null;
+    this.conversationHistory = [];
 
     this.onSignal = () => {
       this.requestStopCurrentPrompt('shutdown');
       this.clearQueuedTelegramMessages();
       this.running = false;
       this.stopLocalInputLoop();
-      console.log('\nStopping HeyAgent...');
+      console.log('\nStopping UshAgent...');
     };
   }
 
@@ -175,29 +184,38 @@ class Bridge {
       await mkdir(ATTACHMENT_DOWNLOAD_DIR, { recursive: true });
 
       const pairing = await this.ensureBridgeReady();
+      this.attachmentHandler = await createAttachmentHandler({
+        telegram: this.telegram,
+        downloadDir: ATTACHMENT_DOWNLOAD_DIR,
+      });
       this.config.setMany({
         provider: this.provider,
         telegramChatId: pairing.chatId,
       });
-      if (this.initialSessionId) {
-        this.setBoundSessionId(this.initialSessionId);
-        this.forceNewNextPrompt = false;
-      } else {
-        this.setBoundSessionId(null);
+      const preferredWorkspacePath = String(this.config.activeWorkspacePath || '').trim();
+      if (preferredWorkspacePath && preferredWorkspacePath !== this.getCurrentWorkspacePath() && fs.existsSync(preferredWorkspacePath)) {
+        this.restoreWorkspaceState(preferredWorkspacePath);
       }
+      this.prepareStartupSession();
+      this.persistWorkspaceState();
 
       console.log(`Connected to Telegram chat ${pairing.chatId}.`);
-      console.log(`HeyAgent is running in ${this.provider} mode. Send /help in Telegram.\n`);
+      console.log(`UshAgent is running in ${this.provider} mode. Send /help in Telegram.\n`);
 
       const providerLabel = formatProviderName(this.provider);
       const startupHeadline =
         this.startMode === 'new'
-          ? `HeyAgent connected. Next message starts a new ${providerLabel} session.`
+          ? `UshAgent connected. Next message starts a new ${providerLabel} session.`
           : this.initialSessionId
-            ? `HeyAgent connected to ${providerLabel} session ${this.initialSessionId}.`
-            : `HeyAgent connected to your last ${providerLabel} session for the current folder: ${process.cwd()}`;
+            ? `UshAgent connected to ${providerLabel} session ${this.initialSessionId}.`
+            : `UshAgent connected. Next message resumes ${this.describeResumeTarget(this.getBoundSessionId())}.`;
 
-      await this.safeSendMessage([startupHeadline, 'Send /help for available commands.', DICTATION_HINT_TEXT].join('\n\n'));
+      const startupMessage = await this.safeSendMessage([startupHeadline, 'Send /help for available commands.', DICTATION_HINT_TEXT].join('\n\n'), {
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      if (Number.isInteger(startupMessage?.message_id)) {
+        this.config.set('telegramControlPanelMessageId', startupMessage.message_id);
+      }
 
       this.startLocalInputLoop();
 
@@ -233,60 +251,686 @@ class Bridge {
     this.writeCliLine(`[${timestamp}] ${label}${suffix}`);
   }
 
-  getBoundSessionId() {
-    return getCurrentSessionId(this.config, this.provider);
+  getLastSessionId() {
+    return getProviderSessionId(this.config, this.provider);
   }
 
-  setBoundSessionId(sessionId) {
-    const normalized = String(sessionId || '').trim() || null;
-    if (this.provider === 'codex') {
-      this.config.set('codexLastSessionId', normalized);
+  getPinnedSessionId() {
+    const workspace = this.config.getWorkspace(this.getCurrentWorkspacePath());
+    return String(workspace?.pinnedSessionId || '').trim() || null;
+  }
+
+  getBoundSessionId() {
+    return this.sessionMode === 'pinned' ? this.getPinnedSessionId() : null;
+  }
+
+  setSessionMode(mode, pinnedSessionId = null) {
+    if (mode === 'pinned') {
+      const normalized = String(pinnedSessionId || '').trim();
+      if (!normalized) {
+        throw new Error('Pinned session id is required.');
+      }
+      this.sessionMode = 'pinned';
+      this.forceNewNextPrompt = false;
+      setProviderSessionId(this.config, this.provider, normalized);
+      this.persistWorkspaceState();
       return;
     }
-    if (this.provider === 'claude') {
-      this.config.set('claudeLastSessionId', normalized);
+
+    if (mode === 'new') {
+      this.sessionMode = 'new';
+      this.forceNewNextPrompt = true;
+      this.persistWorkspaceState();
+      return;
     }
+
+    this.sessionMode = 'latest';
+    this.forceNewNextPrompt = false;
+    this.persistWorkspaceState();
   }
 
-  switchProvider(provider) {
-    if (provider !== 'claude' && provider !== 'codex') {
-      throw new Error(`Unsupported provider: ${provider}`);
+  getCurrentWorkspacePath() {
+    return process.cwd();
+  }
+
+  persistWorkspaceState(workspacePath = this.getCurrentWorkspacePath()) {
+    const normalizedPath = String(workspacePath || '').trim();
+    if (!normalizedPath) {
+      return;
     }
 
-    const rawArgs = provider === 'claude' ? this.config.claudeArgs : this.config.codexArgs;
-    const effective = applyDefaultBypassArgs(provider, rawArgs);
+    this.config.setWorkspace(normalizedPath, {
+      label: path.basename(normalizedPath) || normalizedPath,
+      lastUsedAt: new Date().toISOString(),
+      provider: this.provider,
+      codexArgs: this.config.codexArgs,
+      codexLastSessionId: this.config.codexLastSessionId,
+      sessionMode: this.sessionMode,
+      pinnedSessionId: this.sessionMode === 'pinned' ? this.getLastSessionId() : null,
+    });
+    this.config.setActiveWorkspace(normalizedPath);
+  }
 
+  restoreWorkspaceState(workspacePath) {
+    const normalizedPath = String(workspacePath || '').trim();
+    if (!normalizedPath) {
+      throw new Error('Workspace path is required.');
+    }
+
+    const stats = fs.statSync(normalizedPath);
+    if (!stats.isDirectory()) {
+      throw new Error(`Not a directory: ${normalizedPath}`);
+    }
+
+    const record = this.config.getWorkspace(normalizedPath);
+    const provider = 'codex';
+    const codexArgs = Array.isArray(record?.codexArgs) ? record.codexArgs : this.config.codexArgs;
+    const effective = applyDefaultBypassArgs(provider, codexArgs);
+
+    process.chdir(normalizedPath);
     this.provider = provider;
     this.providerArgs = effective.providerArgs;
+    this.sessionMode = record?.sessionMode === 'pinned' && record?.pinnedSessionId ? 'pinned' : record?.sessionMode === 'new' ? 'new' : 'latest';
+    this.forceNewNextPrompt = this.sessionMode === 'new';
     this.config.setMany({
+      activeWorkspacePath: normalizedPath,
       provider,
-      claudeArgs: provider === 'claude' ? effective.providerArgs : this.config.claudeArgs,
-      codexArgs: provider === 'codex' ? effective.providerArgs : this.config.codexArgs,
+      codexArgs: effective.providerArgs,
+      codexLastSessionId: record?.codexLastSessionId || null,
     });
-
-    return effective;
+    if (this.sessionMode === 'pinned' && record?.pinnedSessionId) {
+      setProviderSessionId(this.config, this.provider, record.pinnedSessionId);
+    }
+    this.persistWorkspaceState(normalizedPath);
   }
 
-  async handleProviderSwitchCommand(provider, rawArgs = '', source = 'telegram') {
+  buildCurrentProjectText() {
+    const workspacePath = this.getCurrentWorkspacePath();
+    const record = this.config.getWorkspace(workspacePath);
+    const lastSessionId = this.getLastSessionId();
+
+    return [
+      `Project: ${record?.label || path.basename(workspacePath) || workspacePath}`,
+      `Path: ${workspacePath}`,
+      `Provider: ${this.provider}`,
+      `Session mode: ${this.sessionMode}`,
+      `Bound session: ${this.getBoundSessionId() || '(latest in current folder)'}`,
+      `Last session: ${lastSessionId || '-'}`,
+      `Next prompt: ${this.forceNewNextPrompt ? 'new session' : `resume ${this.describeResumeTarget(this.getBoundSessionId())}`}`,
+    ].join('\n');
+  }
+
+  buildControlKeyboard() {
+    return {
+      inline_keyboard: [
+        [
+          { text: 'Projects', callback_data: 'projects' },
+          { text: 'Sessions', callback_data: 'sessions' },
+        ],
+        [
+          { text: 'Project', callback_data: 'project_current' },
+          { text: 'Session', callback_data: 'session_status' },
+        ],
+        [
+          { text: 'Usage', callback_data: 'usage' },
+          { text: 'Status', callback_data: 'status' },
+        ],
+        [
+          { text: 'Menu', callback_data: 'menu' },
+          { text: 'Latest', callback_data: 'mode:latest' },
+          { text: 'New', callback_data: 'mode:new' },
+        ],
+      ],
+    };
+  }
+
+  mergeReplyMarkup(...markups) {
+    const inline_keyboard = [];
+    for (const markup of markups) {
+      const rows = Array.isArray(markup?.inline_keyboard) ? markup.inline_keyboard : [];
+      inline_keyboard.push(...rows);
+    }
+    return inline_keyboard.length > 0 ? { inline_keyboard } : null;
+  }
+
+  buildControlPanelText() {
+    const workspacePath = this.getCurrentWorkspacePath();
+    const lastSessionId = this.getLastSessionId();
+    return [
+      `Project: ${path.basename(workspacePath) || workspacePath}`,
+      `Path: ${workspacePath}`,
+      `Mode: ${this.sessionMode}`,
+      `Session: ${this.getBoundSessionId() || '(latest in current folder)'}`,
+      `Last: ${lastSessionId || '-'}`,
+    ].join('\n');
+  }
+
+  buildLastExchangeText() {
+    if (!this.lastExchange) {
+      return 'No completed request/response pair yet.';
+    }
+
+    const sourceLabel = this.lastExchange.source === 'cli' ? 'CLI' : 'Telegram';
+    return [
+      `Source: ${sourceLabel}`,
+      `Request:`,
+      this.lastExchange.prompt,
+      '',
+      `Response:`,
+      this.lastExchange.response,
+    ].join('\n');
+  }
+
+  recordConversationEntry(entry = {}) {
+    const text = String(entry.text || '').trim();
+    if (!text) {
+      return;
+    }
+
+    this.conversationHistory.push({
+      timestamp: entry.timestamp || new Date().toISOString(),
+      source: entry.source || 'system',
+      direction: entry.direction || 'out',
+      text,
+    });
+
+    if (this.conversationHistory.length > MAX_CONVERSATION_HISTORY) {
+      this.conversationHistory.splice(0, this.conversationHistory.length - MAX_CONVERSATION_HISTORY);
+    }
+  }
+
+  buildHistoryText(limit = 10) {
+    const runtime = createProviderRuntime(this.config, this.provider, this.providerArgs);
+    const sessionId = this.getBoundSessionId() || this.getLastSessionId();
+    if (!sessionId) {
+      return 'No active Codex session yet. Send a prompt first or select one with /resume.';
+    }
+
+    const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(20, Number(limit))) : 10;
+    const transcript = runtime.getSessionTranscript({
+      sessionId,
+      limit: normalizedLimit,
+    });
+    if (!Array.isArray(transcript.entries) || transcript.entries.length === 0) {
+      return `No transcript messages found for Codex session ${sessionId}.`;
+    }
+
+    return [
+      `Recent Codex session messages for ${sessionId}:`,
+      ...transcript.entries.map(entry => {
+        const who = entry.role === 'user' ? 'User' : 'Codex';
+        const phase = entry.role === 'assistant' && entry.phase ? ` (${entry.phase})` : '';
+        return `[${formatHistoryTimestamp(entry.timestamp)}] ${who}${phase}: ${toLogPreview(entry.text)}`;
+      }),
+    ].join('\n');
+  }
+
+  buildPreviousMessageText() {
+    const runtime = createProviderRuntime(this.config, this.provider, this.providerArgs);
+    const sessionId = this.getBoundSessionId() || this.getLastSessionId();
+    if (!sessionId) {
+      return 'No active Codex session yet. Send a prompt first or select one with /resume.';
+    }
+
+    const transcript = runtime.getSessionTranscript({
+      sessionId,
+      limit: 1,
+    });
+    const previous = Array.isArray(transcript.entries) ? transcript.entries[transcript.entries.length - 1] : null;
+    if (!previous) {
+      return `No transcript messages found for Codex session ${sessionId}.`;
+    }
+
+    const who = previous.role === 'user' ? 'User' : 'Codex';
+    return [
+      `Latest message in Codex session ${sessionId}:`,
+      `[${formatHistoryTimestamp(previous.timestamp)}] ${who}`,
+      previous.text,
+    ].join('\n');
+  }
+
+  async getUsageSnapshot(options = {}) {
+    const force = options.force === true;
+    const now = Date.now();
+    if (!force && this.cachedUsageSnapshot && now - this.cachedUsageSnapshot.fetchedAt < 60 * 1000) {
+      return this.cachedUsageSnapshot;
+    }
+
+    const snapshot = await fetchCodexUsage({
+      cwd: this.getCurrentWorkspacePath(),
+    });
+    const enriched = {
+      ...snapshot,
+      fetchedAt: now,
+    };
+    this.cachedUsageSnapshot = enriched;
+    return enriched;
+  }
+
+  async buildUsageText(options = {}) {
+    const snapshot = await this.getUsageSnapshot(options);
+    return formatCodexUsage(snapshot);
+  }
+
+  async publishTelegramView(text, options = {}) {
+    const persistMenu = options.persistMenu === true;
+    const messageId = Number.isInteger(options.messageId)
+      ? options.messageId
+      : persistMenu
+        ? this.config.telegramControlPanelMessageId
+        : null;
+    const replyMarkup = options.replyMarkup || this.buildControlKeyboard();
+
+    if (messageId) {
+      try {
+        await this.telegram.editMessageText(this.config.telegramChatId, messageId, text, {
+          replyMarkup,
+        });
+        if (persistMenu) {
+          this.config.set('telegramControlPanelMessageId', messageId);
+        }
+        return;
+      } catch {
+        // Fall through and send a fresh panel message if edit fails.
+      }
+    }
+
+    const sentMessage = await this.safeSendMessage(text, {
+      replyMarkup,
+    });
+
+    if (persistMenu && Number.isInteger(sentMessage?.message_id)) {
+      this.config.set('telegramControlPanelMessageId', sentMessage.message_id);
+    }
+  }
+
+  async openControlPanel(options = {}) {
+    await this.publishTelegramView(this.buildControlPanelText(), {
+      messageId: options.messageId,
+      replyMarkup: this.buildControlKeyboard(),
+      persistMenu: true,
+    });
+  }
+
+  async sendProjectList(source = 'telegram', options = {}) {
+    this.projectListCache = collectKnownWorkspaces(this.config, {
+      limit: 12,
+    });
+    this.logCliEvent(source === 'cli' ? 'CLI projects' : 'Telegram projects', `${this.projectListCache.length} known`);
+    const message = formatWorkspaceList(this.projectListCache, {
+      activeWorkspacePath: this.getCurrentWorkspacePath(),
+    });
+
+    if (source === 'cli') {
+      this.writeCliLine(message);
+      return;
+    }
+
+    await this.publishTelegramView(message, {
+      messageId: options.messageId,
+      replyMarkup: this.buildProjectKeyboard(),
+      persistMenu: options.persistMenu === true,
+    });
+  }
+
+  buildProjectKeyboard() {
+    if (!Array.isArray(this.projectListCache) || this.projectListCache.length === 0) {
+      return null;
+    }
+
+    const inline_keyboard = [];
+    for (let index = 0; index < this.projectListCache.length; index += 2) {
+      const row = [];
+      for (let offset = 0; offset < 2; offset += 1) {
+        const project = this.projectListCache[index + offset];
+        if (!project) {
+          continue;
+        }
+        row.push({
+          text: `${index + offset + 1}. ${project.label}`,
+          callback_data: `project:${index + offset + 1}`,
+        });
+      }
+      if (row.length > 0) {
+        inline_keyboard.push(row);
+      }
+    }
+
+    return this.mergeReplyMarkup({ inline_keyboard }, this.buildControlKeyboard());
+  }
+
+  buildSessionKeyboard() {
+    if (!Array.isArray(this.resumeListCache.sessionIds) || this.resumeListCache.sessionIds.length === 0) {
+      return null;
+    }
+
+    const inline_keyboard = [];
+    for (let index = 0; index < this.resumeListCache.sessionIds.length; index += 3) {
+      const row = [];
+      for (let offset = 0; offset < 3; offset += 1) {
+        const sessionId = this.resumeListCache.sessionIds[index + offset];
+        if (!sessionId) {
+          continue;
+        }
+        row.push({
+          text: String(index + offset + 1),
+          callback_data: `resume:${index + offset + 1}`,
+        });
+      }
+      if (row.length > 0) {
+        inline_keyboard.push(row);
+      }
+    }
+
+    inline_keyboard.push([{ text: 'Latest', callback_data: 'resume:last' }]);
+    return this.mergeReplyMarkup({ inline_keyboard }, this.buildControlKeyboard());
+  }
+
+  async handleCallbackAction(data, callbackQueryId, messageId = null) {
+    const action = String(data || '').trim();
+    if (!action) {
+      return;
+    }
+
+    try {
+      if (action === 'projects') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.sendProjectList('telegram', { messageId, persistMenu: true });
+        return;
+      }
+
+      if (action === 'sessions') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.handleResumeCommand('list', 'telegram', { messageId, persistMenu: true });
+        return;
+      }
+
+      if (action === 'menu') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.openControlPanel({ messageId });
+        return;
+      }
+
+      if (action === 'project_current') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildCurrentProjectText(), {
+          messageId,
+          replyMarkup: this.buildControlKeyboard(),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'session_status') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildSessionStatusText(), {
+          messageId,
+          replyMarkup: this.buildControlKeyboard(),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'status') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(
+          buildStatusText(
+            this.config,
+            this.provider,
+            this.providerArgs,
+            this.sleepInhibitorState,
+            this.attachmentHandler?.getStatusText?.() || null
+          ),
+          {
+            messageId,
+            replyMarkup: this.buildControlKeyboard(),
+            persistMenu: true,
+          }
+        );
+        return;
+      }
+
+      if (action === 'usage') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        const usageText = await this.buildUsageText({
+          force: true,
+        });
+        await this.publishTelegramView(usageText, {
+          messageId,
+          replyMarkup: this.buildControlKeyboard(),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'mode:latest') {
+        await this.telegram.answerCallbackQuery(callbackQueryId, 'Latest mode selected');
+        this.setSessionMode('latest');
+        await this.publishTelegramView(this.buildSessionStatusText(), {
+          messageId,
+          replyMarkup: this.buildControlKeyboard(),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'mode:new') {
+        await this.telegram.answerCallbackQuery(callbackQueryId, 'New mode selected');
+        this.setSessionMode('new');
+        await this.publishTelegramView(this.buildSessionStatusText(), {
+          messageId,
+          replyMarkup: this.buildControlKeyboard(),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action.startsWith('project:')) {
+        const value = action.slice('project:'.length).trim();
+        await this.telegram.answerCallbackQuery(callbackQueryId, 'Switching project...');
+        await this.handleProjectSwitchCommand(value, 'telegram', { messageId, persistMenu: true });
+        return;
+      }
+
+      if (action.startsWith('resume:')) {
+        const value = action.slice('resume:'.length).trim();
+        await this.telegram.answerCallbackQuery(callbackQueryId, 'Switching session...');
+        await this.handleResumeCommand(value, 'telegram', { messageId, persistMenu: true });
+        return;
+      }
+
+      await this.telegram.answerCallbackQuery(callbackQueryId, 'Unknown action.');
+    } catch (error) {
+      this.logger.error(`Callback handling failed: ${error.message}`);
+      try {
+        await this.telegram.answerCallbackQuery(callbackQueryId, 'Action failed.');
+      } catch {
+        // Ignore callback answer failures.
+      }
+    }
+  }
+
+  async handleProjectSwitchCommand(rawArgument = '', source = 'telegram', options = {}) {
+    const raw = String(rawArgument || '').trim();
+    const force = raw.endsWith(' force');
+    const argument = force ? raw.slice(0, -' force'.length).trim() : raw;
     const sourceLabel = source === 'cli' ? 'CLI' : 'Telegram';
-    const args = splitArgs(rawArgs);
-    const effective = this.switchProvider(provider);
-    const sessionId = this.getBoundSessionId() || '-';
-    const argsText = effective.providerArgs.length > 0 ? effective.providerArgs.join(' ') : '(none)';
 
-    this.logCliEvent(`${sourceLabel} provider switch`, provider);
+    if (!argument || argument === 'current') {
+      const message = this.buildCurrentProjectText();
+      if (source === 'cli') {
+        this.writeCliLine(message);
+      } else {
+        await this.publishTelegramView(message, {
+          messageId: options.messageId,
+          replyMarkup: this.buildControlKeyboard(),
+          persistMenu: options.persistMenu === true,
+        });
+      }
+      return;
+    }
 
-    await this.safeSendMessage(
-      [
-        `Provider switched to ${provider}.`,
-        `Session: ${sessionId}`,
-        `Args: ${argsText}`,
-        args.length > 0 ? 'Inline switch args are ignored. Use startup args to set defaults.' : null,
-        effective.defaultBypassApplied ? 'Default bypass mode applied.' : null,
-      ]
-        .filter(Boolean)
-        .join('\n')
-    );
+    if (this.activePromptAbortController) {
+      if (!force) {
+        await this.safeSendMessage('A request is currently running. Use /stop first or /project <target> force.', {
+          replyMarkup: this.buildControlKeyboard(),
+        });
+        return;
+      }
+
+      this.requestStopCurrentPrompt('project_switch');
+      this.clearQueuedTelegramMessages();
+    }
+
+    let targetPath = '';
+    if (/^\d+$/.test(argument)) {
+      const selected = this.projectListCache[Number(argument) - 1];
+      if (!selected) {
+        await this.safeSendMessage('Project list entry not found. Run /projects first.');
+        return;
+      }
+      targetPath = selected.path;
+    } else {
+      targetPath = path.resolve(this.getCurrentWorkspacePath(), argument);
+    }
+
+    if (!fs.existsSync(targetPath)) {
+      await this.safeSendMessage(`Project path does not exist: ${targetPath}`);
+      return;
+    }
+
+    this.persistWorkspaceState();
+    this.restoreWorkspaceState(targetPath);
+    this.resumeListCache = {
+      provider: this.provider,
+      sessionIds: [],
+    };
+
+    const message = [
+      `Switched project to ${targetPath}.`,
+      `Provider: ${this.provider}`,
+      `Session mode: ${this.sessionMode}`,
+      `Session: ${this.getBoundSessionId() || '(latest in current folder)'}`,
+    ].join('\n');
+
+    this.logCliEvent(`${sourceLabel} project switch`, targetPath);
+
+    if (source === 'cli') {
+      this.writeCliLine(message);
+      await this.safeSendMessage(message, { from: 'CLI' });
+      return;
+    }
+
+    await this.publishTelegramView(message, {
+      messageId: options.messageId,
+      replyMarkup: this.buildControlKeyboard(),
+      persistMenu: options.persistMenu === true,
+    });
+  }
+
+  prepareStartupSession() {
+    if (this.initialSessionId) {
+      this.setSessionMode('pinned', this.initialSessionId);
+      return;
+    }
+
+    if (this.startMode === 'new') {
+      this.setSessionMode('new');
+      return;
+    }
+
+    const workspace = this.config.getWorkspace(this.getCurrentWorkspacePath());
+    if (workspace?.sessionMode === 'pinned' && workspace?.pinnedSessionId) {
+      this.setSessionMode('pinned', workspace.pinnedSessionId);
+      return;
+    }
+
+    if (workspace?.sessionMode === 'new') {
+      this.setSessionMode('new');
+      return;
+    }
+
+    this.setSessionMode('latest');
+  }
+
+  describeResumeTarget(sessionId) {
+    const normalized = String(sessionId || '').trim();
+    if (normalized) {
+      return `session ${normalized}`;
+    }
+
+    return `your last ${formatProviderName(this.provider)} session in this folder`;
+  }
+
+  async handleResumeCommand(rawArgument = '', source = 'telegram', options = {}) {
+    const argument = String(rawArgument || '').trim();
+    const sourceLabel = source === 'cli' ? 'CLI' : 'Telegram';
+    const runtime = createProviderRuntime(this.config, this.provider, this.providerArgs);
+    const cachedSessionIds =
+      this.resumeListCache.provider === this.provider && Array.isArray(this.resumeListCache.sessionIds) ? this.resumeListCache.sessionIds : [];
+
+    if (argument === 'list' || argument === 'list all') {
+      const includeAll = argument.endsWith(' all');
+      const result = runtime.listSessions({
+        cwd: process.cwd(),
+        includeAll,
+      });
+      this.resumeListCache = {
+        provider: this.provider,
+        sessionIds: Array.isArray(result.sessions) ? result.sessions.map(session => session.id) : [],
+      };
+      this.logCliEvent(`${sourceLabel} resume`, argument);
+      if (source === 'cli') {
+        this.writeCliLine(result.text);
+      } else {
+        await this.publishTelegramView(result.text, {
+          messageId: options.messageId,
+          replyMarkup: this.buildSessionKeyboard(),
+          persistMenu: options.persistMenu === true,
+        });
+      }
+      return;
+    }
+
+    if (/^\d+$/.test(argument)) {
+      const selectedIndex = Number(argument) - 1;
+      const selectedSessionId = cachedSessionIds[selectedIndex];
+      if (!selectedSessionId) {
+        await this.safeSendMessage('Resume list entry not found. Run /resume list first.');
+        return;
+      }
+
+      this.setSessionMode('pinned', selectedSessionId);
+      this.logCliEvent(`${sourceLabel} resume`, `${argument} -> ${selectedSessionId}`);
+      await this.safeSendMessage(`Next message will resume ${this.describeResumeTarget(selectedSessionId)}.`, {
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (!argument) {
+      const currentTarget = this.getBoundSessionId();
+      this.logCliEvent(`${sourceLabel} resume`, currentTarget || this.sessionMode);
+      await this.safeSendMessage(`Next message will resume ${this.describeResumeTarget(currentTarget)}.`, {
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (argument === 'last') {
+      this.setSessionMode('latest');
+      this.logCliEvent(`${sourceLabel} resume`, 'last');
+      await this.safeSendMessage(`Next message will resume ${this.describeResumeTarget(null)}.`, {
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    this.setSessionMode('pinned', argument);
+    this.logCliEvent(`${sourceLabel} resume`, argument);
+    await this.safeSendMessage(`Next message will resume ${this.describeResumeTarget(argument)}.`, {
+      replyMarkup: this.buildControlKeyboard(),
+    });
   }
 
   startLocalInputLoop() {
@@ -307,7 +951,7 @@ class Bridge {
 
     this.localInputInterface = rl;
     this.writeCliLine('Local CLI input enabled. Type /help for local commands, or type a prompt directly.');
-    rl.setPrompt('hey> ');
+    rl.setPrompt('ushagent> ');
     rl.prompt();
 
     rl.on('line', line => {
@@ -358,14 +1002,23 @@ class Bridge {
         [
           'Local CLI commands:',
           '/help - show this list',
+          '/menu - open or refresh control panel in Telegram',
+          '/history [N] - show recent messages from current Codex session',
+          '/prev - show the latest message from current Codex session',
+          '/projects - list known projects',
+          '/project <number|path|current> - switch or inspect active project',
+          '/sessions - list sessions for current project',
+          '/usage - show remaining Codex usage',
+          '/last - show the last completed request and response',
           '/status - show current status',
+          '/session - show current session binding and next prompt mode',
           '/new - reset session (next prompt starts fresh)',
+          '/resume [session-id|last|list|N] - resume saved, explicit, latest, listed session, or show sessions',
+          '/r [session-id|last|list|N] - alias for /resume',
           '/stop - stop current execution and clear queued Telegram messages',
-          '/claude - switch to Claude provider',
-          '/codex - switch to Codex provider',
           '/say <text> - send a raw message to Telegram',
           '/ask <prompt> - run prompt through provider and send response to Telegram',
-          '/exit - stop HeyAgent',
+          '/exit - stop UshAgent',
           '',
           'Any plain text line is treated as /ask <line>.',
         ].join('\n')
@@ -374,13 +1027,77 @@ class Bridge {
     }
 
     if (line === '/status') {
-      this.writeCliLine(buildStatusText(this.config, this.provider, this.providerArgs, this.sleepInhibitorState));
+      this.writeCliLine(
+        buildStatusText(
+          this.config,
+          this.provider,
+          this.providerArgs,
+          this.sleepInhibitorState,
+          this.attachmentHandler?.getStatusText?.() || null
+        )
+      );
+      return;
+    }
+
+    if (line === '/projects') {
+      await this.sendProjectList('cli');
+      return;
+    }
+
+    if (line === '/usage') {
+      this.writeCliLine(await this.buildUsageText({ force: true }));
+      return;
+    }
+
+    if (line === '/prev') {
+      this.writeCliLine(this.buildPreviousMessageText());
+      return;
+    }
+
+    if (line === '/last') {
+      this.writeCliLine(this.buildLastExchangeText());
+      return;
+    }
+
+    if (line === '/history' || line.startsWith('/history ')) {
+      const argument = line.slice('/history'.length).trim();
+      const limit = argument ? Number(argument) : 10;
+      this.writeCliLine(this.buildHistoryText(limit));
+      return;
+    }
+
+    if (line === '/menu') {
+      await this.openControlPanel();
+      return;
+    }
+
+    if (line === '/project' || line.startsWith('/project ') || line === '/p' || line.startsWith('/p ')) {
+      const commandLength = line.startsWith('/p') && !line.startsWith('/project') ? '/p'.length : '/project'.length;
+      const argument = line.slice(commandLength).trim();
+      await this.handleProjectSwitchCommand(argument, 'cli');
+      return;
+    }
+
+    if (line === '/sessions') {
+      await this.handleResumeCommand('list', 'cli');
+      return;
+    }
+
+    if (line === '/session') {
+      this.writeCliLine(this.buildSessionStatusText());
       return;
     }
 
     if (line === '/new') {
       this.resetSessionMode();
       await this.safeSendMessage('Session reset from CLI. Your next message starts fresh.');
+      return;
+    }
+
+    if (line === '/resume' || line.startsWith('/resume ') || line === '/r' || line.startsWith('/r ')) {
+      const commandLength = line.startsWith('/r') && !line.startsWith('/resume') ? '/r'.length : '/resume'.length;
+      const argument = line.slice(commandLength).trim();
+      await this.handleResumeCommand(argument, 'cli');
       return;
     }
 
@@ -398,21 +1115,9 @@ class Bridge {
       return;
     }
 
-    if (line === '/claude' || line.startsWith('/claude ')) {
-      const argument = line.slice('/claude'.length).trim();
-      await this.handleProviderSwitchCommand('claude', argument, 'cli');
-      return;
-    }
-
-    if (line === '/codex' || line.startsWith('/codex ')) {
-      const argument = line.slice('/codex'.length).trim();
-      await this.handleProviderSwitchCommand('codex', argument, 'cli');
-      return;
-    }
-
     if (line === '/exit') {
       this.running = false;
-      this.writeCliLine('Stopping HeyAgent...');
+      this.writeCliLine('Stopping UshAgent...');
       this.stopLocalInputLoop();
       return;
     }
@@ -433,6 +1138,11 @@ class Bridge {
         this.writeCliLine('Usage: /ask <prompt>');
         return;
       }
+      this.recordConversationEntry({
+        source: 'cli',
+        direction: 'in',
+        text: prompt,
+      });
       await this.queuePrompt(prompt, 'cli');
       return;
     }
@@ -442,15 +1152,33 @@ class Bridge {
       return;
     }
 
+    this.recordConversationEntry({
+      source: 'cli',
+      direction: 'in',
+      text: line,
+    });
     await this.queuePrompt(line, 'cli');
   }
 
   async ensureBridgeReady() {
-    const storedToken = String(this.config.telegramBotToken || '').trim();
+    const tokenInfo =
+      typeof this.config.getTelegramBotTokenInfo === 'function'
+        ? this.config.getTelegramBotTokenInfo()
+        : {
+            token: String(this.config.telegramBotToken || '').trim(),
+            source: this.config.telegramBotToken ? 'config' : null,
+            persisted: Boolean(this.config.telegramBotToken),
+          };
+    const storedToken = String(tokenInfo.token || '').trim();
     let tokenConnected = false;
 
     if (storedToken) {
-      tokenConnected = await this.connectToken(storedToken);
+      tokenConnected = await this.connectToken(storedToken, {
+        persistToken: tokenInfo.persisted !== false,
+      });
+      if (!tokenConnected && tokenInfo.source && tokenInfo.source.startsWith('env:')) {
+        throw new Error(`Telegram bot token from ${tokenInfo.source} is invalid. Fix .env/environment and restart.`);
+      }
     }
 
     if (!tokenConnected) {
@@ -604,32 +1332,47 @@ class Bridge {
     };
   }
 
-  async connectToken(token) {
+  async connectToken(token, options = {}) {
     const normalizedToken = String(token || '').trim();
+    const persistToken = options.persistToken !== false;
     if (!TelegramApi.isLikelyToken(normalizedToken)) {
       console.error('This does not look like a valid Telegram bot token.');
       return false;
     }
 
-    const previousToken = this.config.telegramBotToken;
+    const previousStoredToken =
+      typeof this.config.getStoredTelegramBotToken === 'function' ? this.config.getStoredTelegramBotToken() : this.config.telegramBotToken;
+    const previousBotId = this.config.telegramBotId;
+    const previousBotUsername = this.config.telegramBotUsername;
     const telegram = new TelegramApi(normalizedToken);
 
     try {
       await telegram.ensurePollingMode();
       const me = await telegram.getMe();
 
-      this.telegram = telegram;
-
-      const tokenChanged = previousToken !== normalizedToken;
-      this.config.setMany({
-        telegramBotToken: normalizedToken,
-        telegramBotUsername: me.username || null,
-        telegramBotId: me.id === undefined || me.id === null ? null : String(me.id),
-      });
-
-      if (tokenChanged) {
-        this.config.clearPairing();
+      const nextBotId = me.id === undefined || me.id === null ? null : String(me.id);
+      const nextBotUsername = me.username || null;
+      const botChanged =
+        (previousBotId && nextBotId && previousBotId !== nextBotId) ||
+        (previousBotUsername && nextBotUsername && previousBotUsername !== nextBotUsername);
+      const tokenChanged = persistToken && previousStoredToken && previousStoredToken !== normalizedToken;
+      if (botChanged || tokenChanged) {
+        this.config.clearPairing({ keepBotToken: persistToken });
       }
+
+      this.telegram = telegram;
+      this.config.setMany(
+        persistToken
+          ? {
+              telegramBotToken: normalizedToken,
+              telegramBotUsername: nextBotUsername,
+              telegramBotId: nextBotId,
+            }
+          : {
+              telegramBotUsername: nextBotUsername,
+              telegramBotId: nextBotId,
+            }
+      );
 
       return true;
     } catch (error) {
@@ -643,17 +1386,22 @@ class Bridge {
   }
 
   resetSessionMode() {
-    const updates = {};
+    this.setSessionMode('new');
+  }
 
-    if (this.provider === 'codex') {
-      updates.codexLastSessionId = null;
-    }
-    if (this.provider === 'claude') {
-      updates.claudeLastSessionId = null;
-    }
+  buildSessionStatusText() {
+    const boundSessionId = this.getBoundSessionId();
+    const lastSessionId = this.getLastSessionId();
+    const nextAction = this.forceNewNextPrompt ? `new ${formatProviderName(this.provider)} session` : `resume ${this.describeResumeTarget(boundSessionId)}`;
 
-    this.forceNewNextPrompt = true;
-    this.config.setMany(updates);
+    return [
+      `Workspace: ${this.getCurrentWorkspacePath()}`,
+      `Provider: ${this.provider}`,
+      `Session mode: ${this.sessionMode}`,
+      `Bound session: ${boundSessionId || '(latest in current folder)'}`,
+      `Last session: ${lastSessionId || '-'}`,
+      `Next prompt: ${nextAction}`,
+    ].join('\n');
   }
 
   clearQueuedTelegramMessages() {
@@ -761,7 +1509,16 @@ class Bridge {
           abortSignal: abortController.signal,
         });
 
-        this.forceNewNextPrompt = false;
+        if (this.sessionMode === 'new') {
+          this.sessionMode = 'latest';
+          this.forceNewNextPrompt = false;
+        }
+        this.persistWorkspaceState();
+        this.lastExchange = {
+          source,
+          prompt: cleanPrompt,
+          response: String(response || '').trim() || 'No response.',
+        };
         await this.safeSendMessage(response, { from: providerLabel });
       } catch (error) {
         if (abortController.signal.aborted || this.isPromptAbortError(error)) {
@@ -852,7 +1609,7 @@ class Bridge {
             onStatus(`Paired successfully (chat ${message.chatId}).`);
           }
 
-          await this.telegram.sendMessage(message.chatId, `HeyAgent paired for ${this.provider}.\nSend /help for commands.`);
+          await this.telegram.sendMessage(message.chatId, `UshAgent paired for ${this.provider}.\nSend /help for commands.`);
 
           return {
             chatId: message.chatId,
@@ -881,7 +1638,7 @@ class Bridge {
     const cursor = this.config.telegramUpdateCursor || 0;
 
     if (!chatId) {
-      throw new Error('No Telegram chat is paired. Run `hey reset` then start again.');
+      throw new Error('No Telegram chat is paired. Run `ushagent reset` then start again.');
     }
 
     try {
@@ -906,6 +1663,11 @@ class Bridge {
 
         if (message.text && message.text.trim().startsWith('/')) {
           this.logCliEvent('Telegram command', message.text);
+        }
+
+        if (message.type === 'callback') {
+          await this.handleCallbackAction(message.data || message.text || '', message.callbackQueryId, message.messageId || null);
+          continue;
         }
 
         if (message.fileId) {
@@ -933,44 +1695,18 @@ class Bridge {
       return;
     }
 
+    this.recordConversationEntry({
+      source: 'telegram',
+      direction: 'in',
+      text,
+    });
+
     if (text.startsWith('/')) {
       await this.handleCommand(text);
       return;
     }
 
     await this.enqueueTelegramPrompt(text);
-  }
-
-  isAudioAttachment(type) {
-    return type === 'voice' || type === 'audio';
-  }
-
-  buildAttachmentPrompt(message, filePath) {
-    const lines = [`The user sent a Telegram ${message.type || 'file'} attachment.`, `Local file path: ${filePath}`];
-
-    if (message.fileName) {
-      lines.push(`Original filename: ${message.fileName}`);
-    }
-    if (message.mimeType) {
-      lines.push(`MIME type: ${message.mimeType}`);
-    }
-    if (Number.isFinite(message.fileSizeBytes) && message.fileSizeBytes > 0) {
-      lines.push(`File size bytes: ${message.fileSizeBytes}`);
-    }
-    if (Number.isFinite(message.durationSec) && message.durationSec > 0) {
-      lines.push(`Duration seconds: ${message.durationSec}`);
-    }
-
-    const userText = String(message.caption || message.text || '').trim();
-    lines.push('');
-    if (userText) {
-      lines.push(`User message: ${userText}`);
-    } else {
-      lines.push('User message: (none)');
-    }
-    lines.push('Please inspect the file and respond to the user.');
-
-    return lines.join('\n');
   }
 
   async handleAttachmentMessage(message) {
@@ -981,16 +1717,20 @@ class Bridge {
 
     const durationText = Number.isFinite(message.durationSec) ? ` (${message.durationSec}s)` : '';
     this.logCliEvent(`Telegram -> ${message.type || 'Attachment'}`, `received${durationText}`);
+    this.recordConversationEntry({
+      source: 'telegram',
+      direction: 'in',
+      text: `[attachment:${message.type || 'file'}]${durationText}`,
+    });
     await this.safeSendMessage('Attachment received.');
 
-    if (this.isAudioAttachment(message.type)) {
+    if (this.attachmentHandler?.isAudioAttachment(message.type)) {
       await this.safeSendMessage(DICTATION_HINT_TEXT);
     }
 
     try {
-      const downloadedPath = await this.telegram.downloadFile(fileId, ATTACHMENT_DOWNLOAD_DIR);
-      const prompt = this.buildAttachmentPrompt(message, downloadedPath);
-      await this.enqueueTelegramPrompt(prompt);
+      const prepared = await this.attachmentHandler.createPrompt(message);
+      await this.enqueueTelegramPrompt(prepared.prompt);
     } catch (error) {
       const messageText = error?.message ? String(error.message) : String(error);
       this.logger.error(`Attachment handling failed: ${messageText}`);
@@ -1003,23 +1743,35 @@ class Bridge {
       .trim()
       .split(/\s+/)
       .filter(Boolean);
-    const command = String(parts[0] || '').toLowerCase();
+    const command = normalizeTelegramCommand(parts[0] || '');
     const argument = parts.slice(1).join(' ').trim();
 
     if (command === '/help') {
       await this.safeSendMessage(
         [
-          'HeyAgent commands:',
+          'UshAgent commands:',
           '/help - show command list',
+          '/menu - open or refresh control panel',
+          '/history [N] - show recent messages from current Codex session',
+          '/prev - show the latest message from current Codex session',
+          '/projects - list known projects',
+          '/project <number|path|current> - switch or inspect active project',
+          '/sessions - list sessions for current project',
+          '/usage - show remaining Codex usage',
+          '/last - show the last completed request and response',
           '/new - start a fresh session',
+          '/resume [session-id|last|list|N] - resume saved, explicit, latest, listed session, or show sessions',
+          '/r [session-id|last|list|N] - alias for /resume',
           '/stop - stop current execution and clear queued messages',
-          '/claude - switch to Claude provider',
-          '/codex - switch to Codex provider',
+          '/session - show current session binding and next prompt mode',
           '/status - show current status',
           '',
           `Send any normal message to talk to ${this.provider}.`,
           DICTATION_HINT_TEXT,
-        ].join('\n')
+        ].join('\n'),
+        {
+          replyMarkup: this.buildControlKeyboard(),
+        }
       );
       return;
     }
@@ -1030,18 +1782,83 @@ class Bridge {
       return;
     }
 
-    if (command === '/claude') {
-      await this.handleProviderSwitchCommand('claude', argument, 'telegram');
+    if (command === '/projects') {
+      await this.sendProjectList('telegram', { persistMenu: true });
       return;
     }
 
-    if (command === '/codex') {
-      await this.handleProviderSwitchCommand('codex', argument, 'telegram');
+    if (command === '/usage') {
+      await this.publishTelegramView(await this.buildUsageText({ force: true }), {
+        replyMarkup: this.buildControlKeyboard(),
+        persistMenu: true,
+      });
+      return;
+    }
+
+    if (command === '/last') {
+      await this.safeSendMessage(this.buildLastExchangeText(), {
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (command === '/history') {
+      const limit = argument ? Number(argument) : 10;
+      await this.safeSendMessage(this.buildHistoryText(limit), {
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (command === '/prev') {
+      await this.safeSendMessage(this.buildPreviousMessageText(), {
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (command === '/menu') {
+      await this.openControlPanel();
+      return;
+    }
+
+    if (command === '/project' || command === '/p') {
+      await this.handleProjectSwitchCommand(argument, 'telegram', { persistMenu: true });
+      return;
+    }
+
+    if (command === '/sessions') {
+      await this.handleResumeCommand('list', 'telegram', { persistMenu: true });
+      return;
+    }
+
+    if (command === '/resume' || command === '/r') {
+      await this.handleResumeCommand(argument, 'telegram');
+      return;
+    }
+
+    if (command === '/session') {
+      await this.publishTelegramView(this.buildSessionStatusText(), {
+        replyMarkup: this.buildControlKeyboard(),
+        persistMenu: true,
+      });
       return;
     }
 
     if (command === '/status') {
-      await this.safeSendMessage(buildStatusText(this.config, this.provider, this.providerArgs, this.sleepInhibitorState));
+      await this.publishTelegramView(
+        buildStatusText(
+          this.config,
+          this.provider,
+          this.providerArgs,
+          this.sleepInhibitorState,
+          this.attachmentHandler?.getStatusText?.() || null
+        ),
+        {
+          replyMarkup: this.buildControlKeyboard(),
+          persistMenu: true,
+        }
+      );
       return;
     }
 
@@ -1064,48 +1881,35 @@ class Bridge {
 
   async runProvider(prompt, resume, options = {}) {
     const abortSignal = options.abortSignal || null;
-
-    if (this.provider === 'claude') {
-      return runClaudePrompt(prompt, {
-        resume,
-        extraArgs: this.providerArgs,
-        cwd: process.cwd(),
-        abortSignal,
-        sessionId: this.config.claudeLastSessionId,
-        onSessionId: sessionId => {
-          this.setBoundSessionId(sessionId);
-        },
-      });
-    }
-
-    if (this.provider === 'codex') {
-      return runCodexPrompt(prompt, {
-        resume,
-        extraArgs: this.providerArgs,
-        cwd: process.cwd(),
-        abortSignal,
-        sessionId: this.config.codexLastSessionId,
-        onSessionId: sessionId => {
-          this.setBoundSessionId(sessionId);
-        },
-      });
-    }
-
-    throw new Error(`Unsupported provider: ${this.provider}`);
+    const runtime = createProviderRuntime(this.config, this.provider, this.providerArgs);
+    return runtime.run(prompt, {
+      resume: this.sessionMode !== 'new',
+      cwd: process.cwd(),
+      abortSignal,
+      sessionId: this.sessionMode === 'pinned' ? this.getPinnedSessionId() : '',
+    });
   }
 
   async safeSendMessage(text, options = {}) {
     const chatId = this.config.telegramChatId;
-    const from = String(options.from || 'HeyAgent').trim() || 'HeyAgent';
+    const from = String(options.from || 'UshAgent').trim() || 'UshAgent';
+    const replyMarkup = options.replyMarkup || null;
 
     if (!chatId) {
       return;
     }
 
     this.logCliEvent(`${from} -> Telegram`, text);
+    this.recordConversationEntry({
+      source: from === 'CLI' ? 'cli' : from === formatProviderName(this.provider) ? 'provider' : 'system',
+      direction: 'out',
+      text,
+    });
 
     try {
-      await this.telegram.sendMessage(chatId, text);
+      return await this.telegram.sendMessage(chatId, text, {
+        replyMarkup,
+      });
     } catch (error) {
       this.logger.error(`Outbox send failed: ${error.message}`);
 
@@ -1114,6 +1918,8 @@ class Bridge {
         this.running = false;
         console.error('Telegram bot token is invalid. Restart and enter a new token.');
       }
+
+      return null;
     }
   }
 }

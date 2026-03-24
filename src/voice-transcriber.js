@@ -12,7 +12,7 @@ const DEFAULT_MODEL_NAME = 'ggml-base.en.bin';
 const DEFAULT_MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin';
 const MAX_DOWNLOAD_REDIRECTS = 5;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
-const DEFAULT_MODEL_DIR = path.join(os.homedir(), '.heyagent', 'models');
+const DEFAULT_MODEL_DIR = path.join(os.homedir(), '.ushagent', 'models');
 const DEFAULT_MODEL_PATH = path.join(DEFAULT_MODEL_DIR, DEFAULT_MODEL_NAME);
 const PLATFORM = os.platform();
 
@@ -271,7 +271,7 @@ export async function createVoiceTranscriber() {
     modelHint: modelResolver.modelHint,
     reason: null,
     async transcribeTelegramVoice(telegramApi, fileId) {
-      const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'heyagent-voice-'));
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ushagent-voice-'));
       try {
         const inputPath = await telegramApi.downloadFile(fileId, tmpDir);
         const wavPath = path.join(tmpDir, 'voice.wav');

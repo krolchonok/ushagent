@@ -5,7 +5,7 @@ import { runProcess } from '../process-runner.js';
 
 function createOutputFile() {
   const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  return path.join(os.tmpdir(), `heyagent-codex-${nonce}.txt`);
+  return path.join(os.tmpdir(), `ushagent-codex-${nonce}.txt`);
 }
 
 function pickValue(candidate) {

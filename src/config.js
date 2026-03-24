@@ -2,21 +2,41 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+const TELEGRAM_BOT_TOKEN_ENV_NAMES = ['USHAGENT_TELEGRAM_BOT_TOKEN', 'HEYAGENT_TELEGRAM_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN'];
+
+function readTelegramBotTokenOverride() {
+  for (const envName of TELEGRAM_BOT_TOKEN_ENV_NAMES) {
+    const token = String(process.env[envName] || '').trim();
+    if (token) {
+      return {
+        token,
+        source: `env:${envName}`,
+        persisted: false,
+      };
+    }
+  }
+
+  return null;
+}
+
 class Config {
   constructor() {
-    this.configDir = path.join(os.homedir(), '.heyagent');
+    this.configDir = path.join(os.homedir(), '.ushagent');
     this.configPath = path.join(this.configDir, 'config.json');
     this.defaults = {
       provider: null,
-      claudeArgs: [],
       codexArgs: [],
+      activeWorkspacePath: null,
+      serviceWorkspacePath: null,
+      serviceName: null,
+      workspaces: {},
       telegramBotToken: null,
       telegramBotUsername: null,
       telegramBotId: null,
       telegramChatId: null,
       telegramChatUserId: null,
+      telegramControlPanelMessageId: null,
       telegramUpdateCursor: 0,
-      claudeLastSessionId: null,
       codexLastSessionId: null,
     };
     this._data = { ...this.defaults };
@@ -46,7 +66,9 @@ class Config {
       fs.mkdirSync(this.configDir, { recursive: true });
     }
 
-    fs.writeFileSync(this.configPath, JSON.stringify(this._data, null, 2));
+    const tempPath = `${this.configPath}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tempPath, JSON.stringify(this._data, null, 2));
+    fs.renameSync(tempPath, this.configPath);
     return this._data;
   }
 
@@ -63,18 +85,52 @@ class Config {
     return this._data.provider ?? this.defaults.provider;
   }
 
-  get claudeArgs() {
-    const value = this._data.claudeArgs ?? this.defaults.claudeArgs;
-    return Array.isArray(value) ? value : [];
-  }
-
   get codexArgs() {
     const value = this._data.codexArgs ?? this.defaults.codexArgs;
     return Array.isArray(value) ? value : [];
   }
 
   get telegramBotToken() {
+    return this.getTelegramBotTokenInfo().token;
+  }
+
+  getTelegramBotTokenInfo() {
+    const envOverride = readTelegramBotTokenOverride();
+    if (envOverride) {
+      return envOverride;
+    }
+
+    const token = this._data.telegramBotToken ?? this.defaults.telegramBotToken;
+    return {
+      token,
+      source: token ? 'config' : null,
+      persisted: Boolean(token),
+    };
+  }
+
+  getStoredTelegramBotToken() {
     return this._data.telegramBotToken ?? this.defaults.telegramBotToken;
+  }
+
+  get telegramBotTokenSource() {
+    return this.getTelegramBotTokenInfo().source;
+  }
+
+  get activeWorkspacePath() {
+    return this._data.activeWorkspacePath ?? this.defaults.activeWorkspacePath;
+  }
+
+  get serviceWorkspacePath() {
+    return this._data.serviceWorkspacePath ?? this.defaults.serviceWorkspacePath;
+  }
+
+  get serviceName() {
+    return this._data.serviceName ?? this.defaults.serviceName;
+  }
+
+  get workspaces() {
+    const value = this._data.workspaces ?? this.defaults.workspaces;
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   }
 
   get telegramBotUsername() {
@@ -97,29 +153,71 @@ class Config {
     return this._data.telegramUpdateCursor ?? this.defaults.telegramUpdateCursor;
   }
 
-  get codexLastSessionId() {
-    return this._data.codexLastSessionId ?? this.defaults.codexLastSessionId;
+  get telegramControlPanelMessageId() {
+    const value = this._data.telegramControlPanelMessageId ?? this.defaults.telegramControlPanelMessageId;
+    return Number.isInteger(value) ? value : null;
   }
 
-  get claudeLastSessionId() {
-    return this._data.claudeLastSessionId ?? this.defaults.claudeLastSessionId;
+  get codexLastSessionId() {
+    return this._data.codexLastSessionId ?? this.defaults.codexLastSessionId;
   }
 
   isPaired() {
     return Boolean(this.telegramBotToken && this.telegramChatId);
   }
 
+  getWorkspace(workspacePath) {
+    const key = String(workspacePath || '').trim();
+    if (!key) {
+      return null;
+    }
+
+    const record = this.workspaces[key];
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      return null;
+    }
+
+    return { ...record };
+  }
+
+  setWorkspace(workspacePath, patch = {}) {
+    const key = String(workspacePath || '').trim();
+    if (!key) {
+      throw new Error('Workspace path is required.');
+    }
+
+    const current = this.getWorkspace(key) || {};
+    const next = {
+      ...current,
+      ...patch,
+    };
+
+    return this.save({
+      workspaces: {
+        ...this.workspaces,
+        [key]: next,
+      },
+    });
+  }
+
+  setActiveWorkspace(workspacePath) {
+    const key = String(workspacePath || '').trim() || null;
+    return this.save({
+      activeWorkspacePath: key,
+    });
+  }
+
   clearPairing(options = {}) {
     const keepBotToken = options.keepBotToken !== false;
 
     this.save({
-      telegramBotToken: keepBotToken ? this.telegramBotToken : null,
-      telegramBotUsername: keepBotToken ? this.telegramBotUsername : null,
-      telegramBotId: keepBotToken ? this.telegramBotId : null,
+      telegramBotToken: keepBotToken ? this.getStoredTelegramBotToken() : null,
+      telegramBotUsername: keepBotToken ? this._data.telegramBotUsername ?? this.defaults.telegramBotUsername : null,
+      telegramBotId: keepBotToken ? this._data.telegramBotId ?? this.defaults.telegramBotId : null,
       telegramChatId: null,
       telegramChatUserId: null,
+      telegramControlPanelMessageId: null,
       telegramUpdateCursor: 0,
-      claudeLastSessionId: null,
       codexLastSessionId: null,
     });
   }

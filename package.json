@@ -1,28 +1,29 @@
 {
-  "name": "heyagent",
+  "name": "ushagent",
   "version": "2.0.0",
-  "description": "HeyAgent.dev - Bidirectional Telegram bridge for Claude Code and Codex",
+  "description": "UshAgent.dev - Bidirectional Telegram bridge for Codex",
   "main": "src/bridge.js",
   "type": "module",
   "engines": {
     "node": ">=18.0.0"
   },
   "bin": {
-    "hey": "./bin/hey.js"
+    "ushagent": "./bin/hey.js",
+    "hely": "./bin/hey.js"
   },
   "scripts": {
     "start": "./bin/hey.js",
-    "dev:watch:claude": "node --watch --watch-path=src --watch-path=bin --watch-preserve-output ./bin/hey.js claude",
     "dev:watch:codex": "node --watch --watch-path=src --watch-path=bin --watch-preserve-output ./bin/hey.js codex",
     "dev:watch:status": "node --watch --watch-path=src --watch-path=bin --watch-preserve-output ./bin/hey.js status",
+    "test": "node --test",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "check": "npm run lint && npm run format:check",
     "pack": "npm pack",
-    "pack:install": "npm pack && npm install -g heyagent-*.tgz",
-    "pack:test": "npm pack && mkdir -p .tmp && cd .tmp && npm init -y && npm install ../heyagent-*.tgz && ./node_modules/.bin/hey --version",
+    "pack:install": "npm pack && npm install -g ushagent-*.tgz",
+    "pack:test": "npm pack && mkdir -p .tmp && cd .tmp && npm init -y && npm install ../ushagent-*.tgz && ./node_modules/.bin/ushagent --version",
     "version:patch": "npm version patch",
     "version:minor": "npm version minor",
     "version:major": "npm version major",
@@ -32,26 +33,26 @@
     "release:beta": "npm run check && npm version prerelease --preid=beta && npm publish --tag beta && git push --follow-tags"
   },
   "keywords": [
-    "claude",
     "codex",
     "telegram",
     "cli",
     "terminal",
-    "heyagent"
+    "ushagent"
   ],
-  "author": "HeyAgent Team",
+  "author": "UshAgent Team",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/gergomiklos/heyagent.git"
+    "url": "https://github.com/gergomiklos/ushagent.git"
   },
-  "homepage": "https://heyagent.dev",
+  "homepage": "https://ushagent.dev",
   "bugs": {
-    "url": "https://github.com/gergomiklos/heyagent/issues"
+    "url": "https://github.com/gergomiklos/ushagent/issues"
   },
   "files": [
     "bin/",
     "src/",
+    ".env.example",
     "README.md",
     "LICENSE"
   ],

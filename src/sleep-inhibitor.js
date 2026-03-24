@@ -129,11 +129,11 @@ function startChildBackend(command, args, backend, logger) {
 function startWindowsBackend(logger) {
   const script = [
     '$signature = \'[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);\';',
-    'Add-Type -MemberDefinition $signature -Name NativeSleep -Namespace HeyAgent;',
+    'Add-Type -MemberDefinition $signature -Name NativeSleep -Namespace UshAgent;',
     '$ES_CONTINUOUS = 0x80000000;',
     '$ES_SYSTEM_REQUIRED = 0x00000001;',
     'while ($true) {',
-    '  [HeyAgent.NativeSleep]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED) | Out-Null;',
+    '  [UshAgent.NativeSleep]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED) | Out-Null;',
     '  Start-Sleep -Seconds 30;',
     '}',
   ].join(' ');
@@ -165,7 +165,7 @@ export function startSleepInhibitor(options = {}) {
   if (process.platform === 'linux') {
     return startChildBackend(
       'systemd-inhibit',
-      ['--what=idle:sleep', '--mode=block', '--who=heyagent', '--why=Keep HeyAgent bridge running', 'sleep', 'infinity'],
+      ['--what=idle:sleep', '--mode=block', '--who=ushagent', '--why=Keep UshAgent bridge running', 'sleep', 'infinity'],
       'systemd-inhibit',
       logger
     );

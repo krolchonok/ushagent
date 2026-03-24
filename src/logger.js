@@ -5,14 +5,14 @@ import os from 'node:os';
 let logDirEnsured = false;
 
 class Logger {
-  constructor(service = 'heyagent') {
+  constructor(service = 'ushagent') {
     this.service = service;
-    this.logDir = path.join(os.homedir(), '.heyagent', 'logs');
+    this.logDir = path.join(os.homedir(), '.ushagent', 'logs');
   }
 
   getLogFile() {
     const date = new Date().toLocaleDateString('en-CA');
-    return path.join(this.logDir, `heyagent-${date}.log`);
+    return path.join(this.logDir, `ushagent-${date}.log`);
   }
 
   async ensureLogDir() {
