@@ -11,8 +11,58 @@ export function hasFlag(providerArgs, longName, shortName = null) {
   return false;
 }
 
-export function applyDefaultBypassArgs(provider, providerArgs) {
+function isValidCodexModelValue(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) {
+    return false;
+  }
+
+  if (/^[\\/]+$/.test(normalized)) {
+    return false;
+  }
+
+  return !normalized.startsWith('-');
+}
+
+export function sanitizeProviderArgs(provider, providerArgs) {
   const args = Array.isArray(providerArgs) ? [...providerArgs] : [];
+
+  if (provider !== 'codex') {
+    return args;
+  }
+
+  const sanitized = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = String(args[index] || '').trim();
+    if (!value) {
+      continue;
+    }
+
+    if (value === '--model') {
+      const modelValue = String(args[index + 1] || '').trim();
+      if (isValidCodexModelValue(modelValue)) {
+        sanitized.push('--model', modelValue);
+      }
+      index += 1;
+      continue;
+    }
+
+    if (value.startsWith('--model=')) {
+      const modelValue = value.slice('--model='.length).trim();
+      if (isValidCodexModelValue(modelValue)) {
+        sanitized.push(`--model=${modelValue}`);
+      }
+      continue;
+    }
+
+    sanitized.push(value);
+  }
+
+  return sanitized;
+}
+
+export function applyDefaultBypassArgs(provider, providerArgs) {
+  const args = sanitizeProviderArgs(provider, providerArgs);
 
   if (provider === 'codex') {
     const hasExplicitPermissionMode =

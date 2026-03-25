@@ -3,6 +3,25 @@ import os from 'node:os';
 import path from 'node:path';
 import { runProcess } from '../process-runner.js';
 
+export function getCodexCommand() {
+  return process.platform === 'win32' ? 'codex.cmd' : 'codex';
+}
+
+export function buildCodexArgs(prompt, options = {}) {
+  const resume = Boolean(options.resume);
+  const extraArgs = Array.isArray(options.extraArgs) ? options.extraArgs : [];
+  const sessionId = pickValue(options.sessionId);
+  const promptToken = options.useStdinPrompt === false ? prompt : '-';
+
+  if (resume) {
+    return sessionId
+      ? ['exec', ...extraArgs, 'resume', '--json', sessionId, promptToken]
+      : ['exec', ...extraArgs, 'resume', '--json', '--last', promptToken];
+  }
+
+  return ['exec', ...extraArgs, '--json', '--output-last-message', options.outputFile, promptToken];
+}
+
 function createOutputFile() {
   const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   return path.join(os.tmpdir(), `ushagent-codex-${nonce}.txt`);
@@ -192,25 +211,26 @@ function parseCodexJsonLines(rawText) {
 }
 
 export async function runCodexPrompt(prompt, options = {}) {
-  const resume = Boolean(options.resume);
-  const extraArgs = Array.isArray(options.extraArgs) ? options.extraArgs : [];
   const sessionId = pickValue(options.sessionId);
   const onSessionId = typeof options.onSessionId === 'function' ? options.onSessionId : null;
   const cwd = options.cwd || process.cwd();
   const abortSignal = options.abortSignal || null;
+  const resume = Boolean(options.resume);
   const outputFile = resume ? null : createOutputFile();
-
-  const args = resume
-    ? sessionId
-      ? ['exec', ...extraArgs, 'resume', '--json', sessionId, '--', prompt]
-      : ['exec', ...extraArgs, 'resume', '--json', '--last', '--', prompt]
-    : ['exec', ...extraArgs, '--json', '--output-last-message', outputFile, '--', prompt];
+  const args = buildCodexArgs(prompt, {
+    resume,
+    extraArgs: Array.isArray(options.extraArgs) ? options.extraArgs : [],
+    sessionId,
+    outputFile,
+    useStdinPrompt: true,
+  });
 
   try {
-    const result = await runProcess('codex', args, {
+    const result = await runProcess(getCodexCommand(), args, {
       cwd,
       timeoutMs: 20 * 60 * 1000,
       signal: abortSignal,
+      input: prompt,
     });
 
     const parsed = parseCodexJsonLines(result.stdout || '');
@@ -254,6 +274,12 @@ export async function runCodexPrompt(prompt, options = {}) {
     }
 
     return output;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      throw new Error('Codex CLI was not found in PATH. Install it and make sure `codex` is available in a new terminal session.');
+    }
+
+    throw error;
   } finally {
     try {
       if (outputFile) {

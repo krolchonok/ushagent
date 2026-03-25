@@ -29,6 +29,7 @@ const SETUP_MODE_MANUAL = 'manual_fallback';
 const ATTACHMENT_DOWNLOAD_DIR = path.join(os.tmpdir(), 'ushagent-files');
 const DICTATION_HINT_TEXT = 'Hint: for voice input, use your phone keyboard dictation.';
 const MAX_CONVERSATION_HISTORY = 40;
+const TELEGRAM_POLL_TIMEOUT_SEC = 5;
 const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: 'help', description: 'Show available commands' },
   { command: 'menu', description: 'Open the control panel' },
@@ -178,8 +179,13 @@ class Bridge {
     this.cachedUsageSnapshot = null;
     this.lastExchange = null;
     this.conversationHistory = [];
+    this.isStopping = false;
 
     this.onSignal = () => {
+      if (this.isStopping) {
+        return;
+      }
+      this.isStopping = true;
       this.requestStopCurrentPrompt('shutdown');
       this.clearQueuedTelegramMessages();
       this.running = false;
@@ -1136,6 +1142,10 @@ class Bridge {
     }
 
     if (line === '/exit') {
+      if (this.isStopping) {
+        return;
+      }
+      this.isStopping = true;
       this.running = false;
       this.writeCliLine('Stopping UshAgent...');
       this.stopLocalInputLoop();
@@ -1601,7 +1611,7 @@ class Bridge {
 
     while (this.running) {
       try {
-        const result = await this.telegram.getUpdates(cursor, 20);
+        const result = await this.telegram.getUpdates(cursor, TELEGRAM_POLL_TIMEOUT_SEC);
         const nextCursor = Number.isFinite(result.nextCursor) ? result.nextCursor : cursor;
         if (nextCursor > cursor) {
           cursor = nextCursor;
@@ -1663,7 +1673,7 @@ class Bridge {
     }
 
     try {
-      const result = await this.telegram.getUpdates(cursor, 20);
+      const result = await this.telegram.getUpdates(cursor, TELEGRAM_POLL_TIMEOUT_SEC);
       const nextCursor = Number.isFinite(result.nextCursor) ? result.nextCursor : cursor;
       if (nextCursor > cursor) {
         this.config.set('telegramUpdateCursor', nextCursor);

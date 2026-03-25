@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { confirm } from '@inquirer/prompts';
 import Config from '../src/config.js';
 import Logger from '../src/logger.js';
-import { applyDefaultBypassArgs } from '../src/args.js';
+import { applyDefaultBypassArgs, sanitizeProviderArgs } from '../src/args.js';
 import { loadUshAgentEnv } from '../src/env.js';
 import {
   getServiceDefinition,
@@ -56,6 +56,10 @@ function parseModelShorthand(provider, providerArgs) {
   const token = String(args[0] || '').trim();
   if (!token || token.startsWith('-')) {
     return args;
+  }
+
+  if (/^[\\/]+$/.test(token)) {
+    return [];
   }
 
   if (provider === 'codex') {
@@ -400,7 +404,7 @@ async function main() {
     }
     const savedProviderArgs = config.codexArgs;
     const providerArgs = extracted.providerArgs.length > 0 ? extracted.providerArgs : savedProviderArgs;
-    const normalizedProviderArgs = parseModelShorthand(command, providerArgs);
+    const normalizedProviderArgs = sanitizeProviderArgs(command, parseModelShorthand(command, providerArgs));
     const effectiveArgs = applyDefaultBypassArgs(command, normalizedProviderArgs);
     config.setMany({
       provider: 'codex',
