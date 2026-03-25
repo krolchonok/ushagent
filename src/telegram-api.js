@@ -385,6 +385,9 @@ class TelegramApi {
         if (Number.isInteger(options.messageThreadId)) {
           requestOptions.message_thread_id = options.messageThreadId;
         }
+        if (options.silent === true) {
+          requestOptions.disable_notification = true;
+        }
         if (index === chunks.length - 1 && options.replyMarkup) {
           requestOptions.reply_markup = options.replyMarkup;
         }

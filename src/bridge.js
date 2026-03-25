@@ -289,6 +289,7 @@ class Bridge {
 
       const startupMessage = await this.safeSendMessage([startupHeadline, 'Send /help for available commands.', DICTATION_HINT_TEXT].join('\n\n'), {
         replyMarkup: this.getReplyMarkupForThread(this.getActiveTelegramThreadId()),
+        silent: true,
       });
       if (Number.isInteger(startupMessage?.message_id)) {
         this.config.setTelegramControlPanelMessageId(
@@ -2926,6 +2927,7 @@ class Bridge {
       return await this.telegram.sendMessage(chatId, text, {
         messageThreadId: Number.isInteger(options.messageThreadId) ? options.messageThreadId : this.getActiveTelegramThreadId(),
         replyMarkup,
+        silent: options.silent === true,
       });
     } catch (error) {
       this.logger.error(`Outbox send failed: ${error.message}`);

@@ -49,6 +49,23 @@ test('sendMessage includes message thread id when provided', async () => {
   assert.equal(request.options.message_thread_id, 321);
 });
 
+test('sendMessage can disable notification delivery', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  let request = null;
+  api.bot = {
+    sendMessage: async (chatId, text, options) => {
+      request = { chatId, text, options };
+      return { message_id: 1 };
+    },
+  };
+
+  await api.sendMessage('chat-1', 'Silent', {
+    silent: true,
+  });
+
+  assert.equal(request.options.disable_notification, true);
+});
+
 test('setMyCommands passes normalized commands to Telegram', async () => {
   const api = new TelegramApi('123456:token_token_token_token');
   let request = null;
