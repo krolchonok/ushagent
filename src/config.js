@@ -45,6 +45,10 @@ class Config {
         mainThreadId: null,
         topics: {},
       },
+      telegramReplyKeyboard: {
+        enabled: true,
+        variant: 'standard',
+      },
     };
     this._data = { ...this.defaults };
     this.load();
@@ -186,6 +190,14 @@ class Config {
     };
   }
 
+  get telegramReplyKeyboard() {
+    const value = this._data.telegramReplyKeyboard ?? this.defaults.telegramReplyKeyboard;
+    return {
+      enabled: value?.enabled !== false,
+      variant: value?.variant === 'compact' ? 'compact' : 'standard',
+    };
+  }
+
   isPaired() {
     return Boolean(this.telegramBotToken && this.telegramChatId);
   }
@@ -245,6 +257,7 @@ class Config {
       telegramUpdateCursor: 0,
       codexLastSessionId: null,
       telegramForum: this.defaults.telegramForum,
+      telegramReplyKeyboard: this.defaults.telegramReplyKeyboard,
     });
   }
 
@@ -315,6 +328,16 @@ class Config {
           ...(current.topics[key] || {}),
           ...topicRecord,
         },
+      },
+    });
+  }
+
+  setTelegramReplyKeyboard(data = {}) {
+    const current = this.telegramReplyKeyboard;
+    return this.save({
+      telegramReplyKeyboard: {
+        enabled: data.enabled === undefined ? current.enabled : data.enabled === true,
+        variant: data.variant === 'compact' ? 'compact' : data.variant === undefined ? current.variant : 'standard',
       },
     });
   }

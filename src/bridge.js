@@ -36,6 +36,7 @@ const MAX_CONVERSATION_HISTORY = 40;
 const TELEGRAM_POLL_TIMEOUT_SEC = 5;
 const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: 'help', description: 'Show available commands' },
+  { command: 'keyboard', description: 'Configure reply keyboard buttons' },
   { command: 'menu', description: 'Open the control panel' },
   { command: 'status', description: 'Show current bridge status' },
   { command: 'new', description: 'Start a fresh session on next prompt' },
@@ -286,7 +287,7 @@ class Bridge {
             : `UshAgent connected. Next message resumes ${this.describeResumeTarget(this.getBoundSessionId())}.`;
 
       const startupMessage = await this.safeSendMessage([startupHeadline, 'Send /help for available commands.', DICTATION_HINT_TEXT].join('\n\n'), {
-        replyMarkup: this.getReplyMarkupForThread(this.getActiveTelegramThreadId()),
+        replyMarkup: this.buildPersistentReplyKeyboard(),
         silent: true,
       });
       if (Number.isInteger(startupMessage?.message_id)) {
@@ -800,6 +801,7 @@ class Bridge {
           { text: 'Usage', callback_data: 'usage' },
           { text: 'Status', callback_data: 'status' },
         ],
+        [{ text: 'Keyboard', callback_data: 'keyboard:settings' }],
         [
           { text: 'Host', callback_data: 'forum:open_host' },
           { text: 'Main', callback_data: 'forum:open_main' },
@@ -827,6 +829,7 @@ class Bridge {
           { text: 'Usage', callback_data: 'usage' },
           { text: 'Status', callback_data: 'status' },
         ],
+        [{ text: 'Keyboard', callback_data: 'keyboard:settings' }],
         [{ text: 'Current Project', callback_data: 'main:current_project' }],
       ],
     };
@@ -843,9 +846,90 @@ class Bridge {
           { text: 'Usage', callback_data: 'usage' },
           { text: 'Status', callback_data: 'status' },
         ],
+        [{ text: 'Keyboard', callback_data: 'keyboard:settings' }],
         [{ text: 'Main', callback_data: 'forum:open_main' }],
       ],
     };
+  }
+
+  buildPersistentReplyKeyboard() {
+    const keyboardConfig = this.config.telegramReplyKeyboard;
+    if (keyboardConfig.enabled !== true) {
+      return null;
+    }
+
+    const rows =
+      keyboardConfig.variant === 'compact'
+        ? [
+            ['/menu', '/status', '/usage'],
+            ['/projects', '/sessions', '/stop'],
+          ]
+        : [
+            ['/menu', '/status'],
+            ['/projects', '/sessions'],
+            ['/usage', '/new', '/stop'],
+          ];
+
+    return {
+      keyboard: rows.map(row => row.map(text => ({ text }))),
+      resize_keyboard: true,
+      is_persistent: true,
+      one_time_keyboard: false,
+      input_field_placeholder: 'Use buttons or type a prompt',
+    };
+  }
+
+  buildReplyKeyboardRemoval() {
+    return {
+      remove_keyboard: true,
+    };
+  }
+
+  buildKeyboardSettingsText() {
+    const keyboardConfig = this.config.telegramReplyKeyboard;
+    return [
+      'Reply keyboard settings',
+      `Enabled: ${keyboardConfig.enabled ? 'yes' : 'no'}`,
+      `Layout: ${keyboardConfig.variant}`,
+      '',
+      'This controls the buttons shown under the Telegram input field.',
+      'Inline menus stay available separately via /menu.',
+    ].join('\n');
+  }
+
+  buildKeyboardSettingsMarkup(messageThreadId = null) {
+    const keyboardConfig = this.config.telegramReplyKeyboard;
+    const inline_keyboard = [
+      [
+        {
+          text: keyboardConfig.enabled ? 'Disable' : 'Enable',
+          callback_data: 'keyboard:toggle',
+        },
+      ],
+      [
+        {
+          text: keyboardConfig.variant === 'standard' ? 'Standard ✓' : 'Standard',
+          callback_data: 'keyboard:variant:standard',
+        },
+        {
+          text: keyboardConfig.variant === 'compact' ? 'Compact ✓' : 'Compact',
+          callback_data: 'keyboard:variant:compact',
+        },
+      ],
+      [{ text: 'Refresh Keyboard', callback_data: 'keyboard:sync' }],
+    ];
+
+    return this.mergeReplyMarkup({ inline_keyboard }, this.getReplyMarkupForThread(messageThreadId));
+  }
+
+  async syncReplyKeyboard(messageThreadId = null, options = {}) {
+    const text = String(options.text || '').trim() || 'Reply keyboard updated.';
+    const replyMarkup = options.remove === true ? this.buildReplyKeyboardRemoval() : this.buildPersistentReplyKeyboard();
+    return this.safeSendMessage(text, {
+      messageThreadId,
+      replyMarkup,
+      silent: options.silent === true,
+    });
   }
 
   getReplyMarkupForThread(messageThreadId = null) {
@@ -1278,6 +1362,72 @@ class Bridge {
           messageThreadId,
           replyMarkup: this.buildMainKeyboard(),
           persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'keyboard:settings') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildKeyboardSettingsText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup: this.buildKeyboardSettingsMarkup(messageThreadId),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'keyboard:toggle') {
+        const nextEnabled = this.config.telegramReplyKeyboard.enabled !== true;
+        this.config.setTelegramReplyKeyboard({
+          enabled: nextEnabled,
+        });
+        await this.telegram.answerCallbackQuery(callbackQueryId, nextEnabled ? 'Reply keyboard enabled' : 'Reply keyboard disabled');
+        await this.publishTelegramView(this.buildKeyboardSettingsText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup: this.buildKeyboardSettingsMarkup(messageThreadId),
+          persistMenu: true,
+        });
+        await this.syncReplyKeyboard(messageThreadId, {
+          text: nextEnabled ? 'Reply keyboard enabled.' : 'Reply keyboard removed.',
+          remove: nextEnabled !== true,
+          silent: true,
+        });
+        return;
+      }
+
+      if (action === 'keyboard:sync') {
+        await this.telegram.answerCallbackQuery(callbackQueryId, 'Reply keyboard refreshed');
+        await this.syncReplyKeyboard(messageThreadId, {
+          text: this.config.telegramReplyKeyboard.enabled ? 'Reply keyboard refreshed.' : 'Reply keyboard is disabled.',
+          remove: this.config.telegramReplyKeyboard.enabled !== true,
+          silent: true,
+        });
+        await this.publishTelegramView(this.buildKeyboardSettingsText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup: this.buildKeyboardSettingsMarkup(messageThreadId),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action.startsWith('keyboard:variant:')) {
+        const variant = action.slice('keyboard:variant:'.length).trim();
+        this.config.setTelegramReplyKeyboard({
+          variant,
+        });
+        await this.telegram.answerCallbackQuery(callbackQueryId, `Layout: ${variant === 'compact' ? 'compact' : 'standard'}`);
+        await this.publishTelegramView(this.buildKeyboardSettingsText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup: this.buildKeyboardSettingsMarkup(messageThreadId),
+          persistMenu: true,
+        });
+        await this.syncReplyKeyboard(messageThreadId, {
+          text: 'Reply keyboard updated.',
+          silent: true,
         });
         return;
       }
@@ -3047,6 +3197,7 @@ class Bridge {
         [
           'UshAgent commands:',
           '/help - show command list',
+          '/keyboard - configure reply keyboard buttons',
           '/menu - open or refresh control panel',
           '/history [N] - show recent messages from current Codex session',
           '/prev - show the latest message from current Codex session',
@@ -3075,6 +3226,19 @@ class Bridge {
     if (command === '/new') {
       this.resetSessionMode();
       await this.safeSendMessage('Session reset. Your next message starts fresh.');
+      return;
+    }
+
+    if (command === '/keyboard') {
+      await this.publishTelegramView(this.buildKeyboardSettingsText(), {
+        replyMarkup: this.buildKeyboardSettingsMarkup(this.getActiveTelegramThreadId()),
+        persistMenu: true,
+      });
+      await this.syncReplyKeyboard(this.getActiveTelegramThreadId(), {
+        text: this.config.telegramReplyKeyboard.enabled ? 'Reply keyboard refreshed.' : 'Reply keyboard is disabled.',
+        remove: this.config.telegramReplyKeyboard.enabled !== true,
+        silent: true,
+      });
       return;
     }
 
@@ -3190,7 +3354,10 @@ class Bridge {
   async safeSendMessage(text, options = {}) {
     const chatId = this.config.telegramChatId;
     const from = String(options.from || 'UshAgent').trim() || 'UshAgent';
-    const replyMarkup = options.replyMarkup || null;
+    const replyMarkup =
+      options.replyMarkup !== undefined
+        ? options.replyMarkup
+        : this.buildPersistentReplyKeyboard();
 
     if (!chatId) {
       return;

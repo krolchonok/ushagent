@@ -28,6 +28,10 @@ class FakeConfig {
         mainThreadId: null,
         topics: {},
       },
+      telegramReplyKeyboard: {
+        enabled: true,
+        variant: 'standard',
+      },
     };
   }
 
@@ -84,6 +88,14 @@ class FakeConfig {
           ...topicRecord,
         },
       },
+    };
+    return this._data;
+  }
+
+  setTelegramReplyKeyboard(data = {}) {
+    this._data.telegramReplyKeyboard = {
+      ...this._data.telegramReplyKeyboard,
+      ...data,
     };
     return this._data;
   }
@@ -206,6 +218,10 @@ class FakeConfig {
 
   get telegramForum() {
     return this._data.telegramForum;
+  }
+
+  get telegramReplyKeyboard() {
+    return this._data.telegramReplyKeyboard;
   }
 }
 
@@ -961,6 +977,61 @@ test('safeSendMessage returns sent Telegram message so menu state can persist', 
   }
 });
 
+test('safeSendMessage applies persistent reply keyboard by default', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    let requestOptions = null;
+    bridge.telegram = {
+      sendMessage: async (_chatId, _text, options = {}) => {
+        requestOptions = options;
+        return { message_id: 77 };
+      },
+    };
+    bridge.safeSendMessage = Bridge.prototype.safeSendMessage.bind(bridge);
+
+    await bridge.safeSendMessage('hello');
+
+    assert.ok(Array.isArray(requestOptions.replyMarkup.keyboard));
+    assert.equal(requestOptions.replyMarkup.resize_keyboard, true);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('keyboard settings callback toggles reply keyboard config', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    let published = null;
+    bridge.telegram = {
+      answerCallbackQuery: async () => null,
+    };
+    bridge.publishTelegramView = async (text, options = {}) => {
+      published = { text, options };
+    };
+    const sent = [];
+    bridge.safeSendMessage = async (text, options = {}) => {
+      sent.push({ text, options });
+      return { message_id: 1 };
+    };
+
+    await bridge.handleCallbackAction('keyboard:toggle', 'cb-1', 44, null);
+
+    assert.equal(config.telegramReplyKeyboard.enabled, false);
+    assert.match(published.text, /Reply keyboard settings/);
+    assert.equal(sent[0].options.replyMarkup.remove_keyboard, true);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('handleCommand /last returns the last completed request and response', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
@@ -1199,7 +1270,7 @@ test('connectToken registers Telegram bot commands during initialization', async
     assert.ok(Array.isArray(registeredCommands));
     assert.deepEqual(
       registeredCommands.map(command => command.command),
-      ['help', 'menu', 'status', 'new', 'session', 'sessions', 'resume', 'project', 'projects', 'usage', 'history', 'prev', 'last', 'stop']
+      ['help', 'keyboard', 'menu', 'status', 'new', 'session', 'sessions', 'resume', 'project', 'projects', 'usage', 'history', 'prev', 'last', 'stop']
     );
     assert.equal(config.telegramBotUsername, 'freshbot');
   } finally {
