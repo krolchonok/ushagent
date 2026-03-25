@@ -34,6 +34,7 @@ const ATTACHMENT_DOWNLOAD_DIR = path.join(os.tmpdir(), 'ushagent-files');
 const DICTATION_HINT_TEXT = 'Hint: for voice input, use your phone keyboard dictation.';
 const MAX_CONVERSATION_HISTORY = 40;
 const TELEGRAM_POLL_TIMEOUT_SEC = 5;
+const CODEX_LONG_RUNNING_NOTICE_MS = 20 * 60 * 1000;
 const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: 'help', description: 'Show available commands' },
   { command: 'keyboard', description: 'Configure reply keyboard buttons' },
@@ -1592,6 +1593,32 @@ class Bridge {
         return;
       }
 
+      if (action.startsWith('stop_execution:')) {
+        const explicitThreadId = Number(action.slice('stop_execution:'.length).trim());
+        const targetThreadId = Number.isInteger(explicitThreadId) ? explicitThreadId : messageThreadId;
+        const executionKey = this.getExecutionKeyForPrompt('telegram', {
+          messageThreadId: targetThreadId,
+        });
+        const stopped = this.requestStopCurrentPrompt('manual_stop', { executionKey });
+        const clearedCount = this.clearQueuedTelegramMessages({ executionKey });
+
+        await this.telegram.answerCallbackQuery(
+          callbackQueryId,
+          stopped ? 'Stopping current task...' : clearedCount > 0 ? 'Cleared queued messages.' : 'No active task to stop.'
+        );
+
+        if (stopped) {
+          await this.safeSendMessage(`Stopping current ${formatProviderName(this.provider)} task...`, {
+            messageThreadId: targetThreadId,
+          });
+        } else if (clearedCount > 0) {
+          await this.safeSendMessage(`Cleared ${clearedCount} queued message${clearedCount === 1 ? '' : 's'}.`, {
+            messageThreadId: targetThreadId,
+          });
+        }
+        return;
+      }
+
       if (action === 'mode:latest') {
         await this.telegram.answerCallbackQuery(callbackQueryId, 'Latest mode selected');
         this.setSessionMode('latest');
@@ -2428,6 +2455,8 @@ class Bridge {
         activeSource: null,
         activeAbortReason: null,
         launchScheduled: false,
+        longRunningNoticeTimer: null,
+        longRunningNoticeSent: false,
       });
     }
 
@@ -2493,6 +2522,45 @@ class Bridge {
     state.activeAbortReason = reason;
     controller.abort();
     return true;
+  }
+
+  clearLongRunningNotice(state) {
+    if (!state) {
+      return;
+    }
+
+    if (state.longRunningNoticeTimer) {
+      clearTimeout(state.longRunningNoticeTimer);
+      state.longRunningNoticeTimer = null;
+    }
+
+    state.longRunningNoticeSent = false;
+  }
+
+  scheduleLongRunningNotice(state, context, providerLabel) {
+    this.clearLongRunningNotice(state);
+
+    if (!Number.isInteger(context?.sourceThreadId) || !this.config.telegramChatId) {
+      return;
+    }
+
+    state.longRunningNoticeTimer = setTimeout(() => {
+      state.longRunningNoticeTimer = null;
+
+      if (!state.activeAbortController || state.activeAbortController.signal.aborted) {
+        return;
+      }
+
+      state.longRunningNoticeSent = true;
+      this.safeSendMessage(`${providerLabel} is still working after 20 minutes.`, {
+        messageThreadId: context.sourceThreadId,
+        replyMarkup: {
+          inline_keyboard: [[{ text: 'Stop Current Task', callback_data: `stop_execution:${context.sourceThreadId}` }]],
+        },
+      }).catch(error => {
+        this.logger.warn(`Failed to send long-running notice: ${error.message}`);
+      });
+    }, CODEX_LONG_RUNNING_NOTICE_MS);
   }
 
   buildPromptExecutionContext(source, options = {}) {
@@ -2708,6 +2776,7 @@ class Bridge {
       state.activeSource = source;
       state.activeAbortReason = null;
       state.launchScheduled = false;
+      state.longRunningNoticeSent = false;
 
       try {
         if (source === 'telegram' && Number.isInteger(sourceThreadId) && this.telegramForumState?.enabled) {
@@ -2728,6 +2797,8 @@ class Bridge {
           if (Number.isInteger(progressMessage?.message_id)) {
             progressMessageId = progressMessage.message_id;
           }
+
+          this.scheduleLongRunningNotice(state, context, providerLabel);
         }
 
         const response = await this.runProviderWithContext(cleanPrompt, context, {
@@ -2786,6 +2857,7 @@ class Bridge {
         });
         this.logger.error(`Provider execution failed: ${error.message}`);
       } finally {
+        this.clearLongRunningNotice(state);
         if (state.activeAbortController === abortController) {
           state.activeAbortController = null;
           state.activeSource = null;

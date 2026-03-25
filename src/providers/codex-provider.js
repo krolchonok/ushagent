@@ -272,7 +272,7 @@ export async function runCodexPrompt(prompt, options = {}) {
     let stdoutBuffer = '';
     const result = await runProcess(getCodexCommand(), args, {
       cwd,
-      timeoutMs: 20 * 60 * 1000,
+      timeoutMs: 0,
       signal: abortSignal,
       input: prompt,
       onStdoutChunk: chunk => {

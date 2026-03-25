@@ -1032,6 +1032,42 @@ test('keyboard settings callback toggles reply keyboard config', async () => {
   }
 });
 
+test('stop_execution callback stops only the targeted telegram execution lane', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    const stopped = [];
+    const cleared = [];
+    const sent = [];
+    bridge.telegram = {
+      answerCallbackQuery: async () => null,
+    };
+    bridge.requestStopCurrentPrompt = (_reason, options = {}) => {
+      stopped.push(options.executionKey);
+      return true;
+    };
+    bridge.clearQueuedTelegramMessages = (options = {}) => {
+      cleared.push(options.executionKey);
+      return 0;
+    };
+    bridge.safeSendMessage = async (text, options = {}) => {
+      sent.push({ text, options });
+      return { message_id: 1 };
+    };
+
+    await bridge.handleCallbackAction('stop_execution:77', 'cb-1', 44, 30);
+
+    assert.deepEqual(stopped, ['telegram:77']);
+    assert.deepEqual(cleared, ['telegram:77']);
+    assert.equal(sent[0].options.messageThreadId, 77);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('handleCommand /last returns the last completed request and response', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();

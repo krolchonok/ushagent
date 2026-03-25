@@ -29,7 +29,8 @@ export function resolveProcessSpawn(command, args = []) {
 }
 
 export function runProcess(command, args, options = {}) {
-  const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+  const timeoutMs =
+    options.timeoutMs === undefined || options.timeoutMs === null ? DEFAULT_TIMEOUT_MS : Math.max(0, Number(options.timeoutMs) || 0);
   const cwd = options.cwd || process.cwd();
   const signal = options.signal || null;
   const input = options.input === undefined || options.input === null ? null : String(options.input);
@@ -68,17 +69,19 @@ export function runProcess(command, args, options = {}) {
       signal.addEventListener('abort', onAbort, { once: true });
     }
 
-    timeout = setTimeout(() => {
-      if (completed) {
-        return;
-      }
-      completed = true;
-      if (signal) {
-        signal.removeEventListener('abort', onAbort);
-      }
-      child.kill('SIGTERM');
-      reject(new Error(`${command} timed out after ${Math.floor(timeoutMs / 1000)} seconds`));
-    }, timeoutMs);
+    if (timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        if (completed) {
+          return;
+        }
+        completed = true;
+        if (signal) {
+          signal.removeEventListener('abort', onAbort);
+        }
+        child.kill('SIGTERM');
+        reject(new Error(`${command} timed out after ${Math.floor(timeoutMs / 1000)} seconds`));
+      }, timeoutMs);
+    }
 
     child.stdout.on('data', chunk => {
       const text = chunk.toString();
