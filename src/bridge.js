@@ -527,10 +527,17 @@ class Bridge {
   }
 
   getLastSessionId() {
-    return getProviderSessionId(this.config, this.provider);
+    const topicSessionId = this.getForumTopicProviderSessionId(this.getActiveTelegramThreadId(), this.provider);
+    return topicSessionId || getProviderSessionId(this.config, this.provider);
   }
 
   getPinnedSessionId() {
+    const topic = this.getActiveForumProjectTopic();
+    const topicPinnedSessionId = String(topic?.pinnedSessionId || '').trim() || null;
+    if (topicPinnedSessionId) {
+      return topicPinnedSessionId;
+    }
+
     const workspace = this.config.getWorkspace(this.getCurrentWorkspacePath());
     return String(workspace?.pinnedSessionId || '').trim() || null;
   }
@@ -540,6 +547,8 @@ class Bridge {
   }
 
   setSessionMode(mode, pinnedSessionId = null) {
+    const activeTopic = this.getActiveForumProjectTopic();
+
     if (mode === 'pinned') {
       const normalized = String(pinnedSessionId || '').trim();
       if (!normalized) {
@@ -548,6 +557,13 @@ class Bridge {
       this.sessionMode = 'pinned';
       this.forceNewNextPrompt = false;
       setProviderSessionId(this.config, this.provider, normalized);
+      if (activeTopic) {
+        this.setForumTopicSessionState(activeTopic.threadId, this.provider, {
+          sessionMode: 'pinned',
+          pinnedSessionId: normalized,
+          lastSessionId: normalized,
+        });
+      }
       this.persistWorkspaceState();
       return;
     }
@@ -555,12 +571,24 @@ class Bridge {
     if (mode === 'new') {
       this.sessionMode = 'new';
       this.forceNewNextPrompt = true;
+      if (activeTopic) {
+        this.setForumTopicSessionState(activeTopic.threadId, this.provider, {
+          sessionMode: 'new',
+          pinnedSessionId: null,
+        });
+      }
       this.persistWorkspaceState();
       return;
     }
 
     this.sessionMode = 'latest';
     this.forceNewNextPrompt = false;
+    if (activeTopic) {
+      this.setForumTopicSessionState(activeTopic.threadId, this.provider, {
+        sessionMode: 'latest',
+        pinnedSessionId: null,
+      });
+    }
     this.persistWorkspaceState();
   }
 
@@ -1233,6 +1261,108 @@ class Bridge {
     return topic && typeof topic === 'object' ? { key: topicKey, ...topic } : null;
   }
 
+  getActiveForumProjectTopic() {
+    return this.findForumTopicByThreadId(this.getActiveTelegramThreadId());
+  }
+
+  getForumTopicProviderSessionId(messageThreadId, provider = this.provider) {
+    if (!Number.isInteger(messageThreadId)) {
+      return null;
+    }
+
+    const topic = this.findForumTopicByThreadId(messageThreadId);
+    if (!topic || topic.kind !== 'project') {
+      return null;
+    }
+
+    const definition = getProviderDefinition(provider);
+    return String(topic?.[definition.sessionKey] || '').trim() || null;
+  }
+
+  getForumTopicSessionState(messageThreadId, provider = this.provider) {
+    if (!Number.isInteger(messageThreadId)) {
+      return null;
+    }
+
+    const topic = this.findForumTopicByThreadId(messageThreadId);
+    if (!topic || topic.kind !== 'project') {
+      return null;
+    }
+
+    return {
+      topic,
+      lastSessionId: this.getForumTopicProviderSessionId(messageThreadId, provider),
+      sessionMode: topic.sessionMode === 'pinned' && topic.pinnedSessionId ? 'pinned' : topic.sessionMode === 'new' ? 'new' : 'latest',
+      pinnedSessionId: String(topic.pinnedSessionId || '').trim() || null,
+    };
+  }
+
+  setForumTopicSessionState(messageThreadId, provider = this.provider, patch = {}) {
+    if (!Number.isInteger(messageThreadId)) {
+      return null;
+    }
+
+    const topic = this.findForumTopicByThreadId(messageThreadId);
+    if (!topic || topic.kind !== 'project') {
+      return null;
+    }
+
+    const definition = getProviderDefinition(provider);
+    const nextPatch = {
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (patch.lastSessionId !== undefined) {
+      nextPatch[definition.sessionKey] = String(patch.lastSessionId || '').trim() || null;
+    }
+
+    if (patch.sessionMode !== undefined) {
+      const normalizedMode = String(patch.sessionMode || '').trim();
+      nextPatch.sessionMode = normalizedMode === 'pinned' && patch.pinnedSessionId ? 'pinned' : normalizedMode === 'new' ? 'new' : 'latest';
+    }
+
+    if (patch.pinnedSessionId !== undefined) {
+      nextPatch.pinnedSessionId = String(patch.pinnedSessionId || '').trim() || null;
+    }
+
+    this.config.setTelegramTopic(topic.key, nextPatch);
+    if (this.telegramForumState?.topics) {
+      this.telegramForumState = {
+        ...this.telegramForumState,
+        topics: {
+          ...this.telegramForumState.topics,
+          [topic.key]: {
+            ...(this.telegramForumState.topics[topic.key] || {}),
+            ...nextPatch,
+          },
+        },
+      };
+    }
+
+    return this.findForumTopicByThreadId(messageThreadId);
+  }
+
+  syncForumSessionForThread(messageThreadId = null, provider = this.provider) {
+    const topicState = this.getForumTopicSessionState(messageThreadId, provider);
+    if (!topicState) {
+      return null;
+    }
+
+    this.sessionMode = topicState.sessionMode;
+    this.forceNewNextPrompt = topicState.sessionMode === 'new';
+    this.config.setMany({
+      provider,
+      codexLastSessionId: topicState.lastSessionId || null,
+    });
+    if (topicState.sessionMode === 'pinned' && topicState.pinnedSessionId) {
+      setProviderSessionId(this.config, provider, topicState.pinnedSessionId);
+    } else {
+      setProviderSessionId(this.config, provider, topicState.lastSessionId || null);
+    }
+
+    return topicState;
+  }
+
   syncForumWorkspaceForThread(messageThreadId = null) {
     if (!this.telegramForumState?.enabled || !Number.isInteger(messageThreadId)) {
       return null;
@@ -1258,6 +1388,8 @@ class Bridge {
         sessionIds: [],
       };
     }
+
+    this.syncForumSessionForThread(topic.threadId);
 
     return topic;
   }
@@ -2568,16 +2700,18 @@ class Bridge {
     const record = this.config.getWorkspace(workspacePath);
     const provider = String(record?.provider || this.provider).trim() || this.provider;
     const providerArgs = Array.isArray(record?.codexArgs) ? [...record.codexArgs] : [...this.providerArgs];
-    const sessionMode =
-      record?.sessionMode === 'pinned' && record?.pinnedSessionId ? 'pinned' : record?.sessionMode === 'new' ? 'new' : 'latest';
-    const pinnedSessionId = String(record?.pinnedSessionId || '').trim() || null;
-    const lastSessionId = this.getWorkspaceProviderSessionId(workspacePath, provider);
     const sourceThreadId =
       source === 'telegram'
         ? Number.isInteger(options.messageThreadId)
           ? options.messageThreadId
           : this.getActiveTelegramThreadId()
         : null;
+    const topicSessionState = this.getForumTopicSessionState(sourceThreadId, provider);
+    const sessionMode =
+      topicSessionState?.sessionMode ||
+      (record?.sessionMode === 'pinned' && record?.pinnedSessionId ? 'pinned' : record?.sessionMode === 'new' ? 'new' : 'latest');
+    const pinnedSessionId = topicSessionState?.pinnedSessionId || String(record?.pinnedSessionId || '').trim() || null;
+    const lastSessionId = topicSessionState?.lastSessionId || this.getWorkspaceProviderSessionId(workspacePath, provider);
     const executionKey = this.getExecutionKeyForPrompt(source, {
       messageThreadId: sourceThreadId,
       workspacePath,
@@ -2622,6 +2756,14 @@ class Bridge {
   finalizeExecutionContext(context) {
     const nextSessionMode = context.sessionMode === 'new' ? 'latest' : context.sessionMode;
     const nextPinnedSessionId = nextSessionMode === 'pinned' ? context.pinnedSessionId : null;
+
+    if (Number.isInteger(context.sourceThreadId)) {
+      this.setForumTopicSessionState(context.sourceThreadId, context.provider, {
+        lastSessionId: context.lastSessionId,
+        sessionMode: nextSessionMode,
+        pinnedSessionId: nextPinnedSessionId,
+      });
+    }
 
     this.persistWorkspaceRecord(context.workspacePath, {
       provider: context.provider,

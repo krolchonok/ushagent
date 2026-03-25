@@ -681,6 +681,71 @@ test('pollOnce switches workspace when message arrives in another project topic'
   }
 });
 
+test('syncForumWorkspaceForThread restores session binding from the target project topic', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const projectA = path.join(rootDir, 'project-a');
+  const projectB = path.join(rootDir, 'project-b');
+  mkdirSync(projectA);
+  mkdirSync(projectB);
+
+  const previousCwd = process.cwd();
+  process.chdir(projectA);
+
+  try {
+    const { bridge, config } = createBridge(projectA, {
+      sessionMode: 'latest',
+      lastSessionId: 'session-a',
+    });
+    config.setWorkspace(projectB, {
+      label: 'project-b',
+      provider: 'codex',
+      codexArgs: config.codexArgs,
+      codexLastSessionId: 'workspace-session-b',
+      sessionMode: 'latest',
+      pinnedSessionId: null,
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {
+        'project:host:a': {
+          kind: 'project',
+          threadId: 30,
+          title: 'HOST | project-a',
+          hostname: os.hostname(),
+          workspacePath: projectA,
+          codexLastSessionId: 'topic-session-a',
+          sessionMode: 'latest',
+          pinnedSessionId: null,
+        },
+        'project:host:b': {
+          kind: 'project',
+          threadId: 77,
+          title: 'HOST | project-b',
+          hostname: os.hostname(),
+          workspacePath: projectB,
+          codexLastSessionId: 'topic-session-b',
+          sessionMode: 'pinned',
+          pinnedSessionId: 'topic-session-b',
+        },
+      },
+    };
+    bridge.telegramThreadId = 30;
+
+    bridge.syncForumWorkspaceForThread(77);
+
+    assert.equal(process.cwd(), projectB);
+    assert.equal(bridge.sessionMode, 'pinned');
+    assert.equal(bridge.getLastSessionId(), 'topic-session-b');
+    assert.equal(bridge.getBoundSessionId(), 'topic-session-b');
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('startTelegramDispatch groups only pending Telegram messages from the same topic', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
