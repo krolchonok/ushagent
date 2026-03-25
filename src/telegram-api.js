@@ -205,6 +205,7 @@ function normalizeMessage(update) {
   return {
     updateId: Number.isInteger(update.update_id) ? update.update_id : null,
     messageId: Number.isInteger(message.message_id) ? message.message_id : null,
+    messageThreadId: Number.isInteger(message.message_thread_id) ? message.message_thread_id : null,
     chatId: message.chat?.id === undefined || message.chat?.id === null ? null : String(message.chat.id),
     chatType: typeof message.chat?.type === 'string' ? message.chat.type : null,
     userId: message.from?.id === undefined || message.from?.id === null ? null : String(message.from.id),
@@ -230,6 +231,7 @@ function normalizeCallbackQuery(update) {
     updateId: Number.isInteger(update.update_id) ? update.update_id : null,
     callbackQueryId: typeof callbackQuery.id === 'string' ? callbackQuery.id : null,
     messageId: Number.isInteger(message?.message_id) ? message.message_id : null,
+    messageThreadId: Number.isInteger(message?.message_thread_id) ? message.message_thread_id : null,
     chatId: message?.chat?.id === undefined || message?.chat?.id === null ? null : String(message.chat.id),
     chatType: typeof message?.chat?.type === 'string' ? message.chat.type : null,
     userId: callbackQuery.from?.id === undefined || callbackQuery.from?.id === null ? null : String(callbackQuery.from.id),
@@ -290,6 +292,44 @@ class TelegramApi {
     }
   }
 
+  async getChat(chatId) {
+    const targetChatId = String(chatId || '').trim();
+    if (!targetChatId) {
+      throw new TelegramApiError('Missing Telegram chat ID');
+    }
+
+    try {
+      return await this.bot.getChat(targetChatId);
+    } catch (error) {
+      throw toTelegramError(error, 'Failed to fetch Telegram chat info');
+    }
+  }
+
+  async createForumTopic(chatId, name, options = {}) {
+    const targetChatId = String(chatId || '').trim();
+    const normalizedName = String(name || '').trim();
+    if (!targetChatId) {
+      throw new TelegramApiError('Missing Telegram chat ID');
+    }
+    if (!normalizedName) {
+      throw new TelegramApiError('Missing Telegram topic name');
+    }
+
+    const form = {};
+    if (options.iconColor !== undefined) {
+      form.icon_color = options.iconColor;
+    }
+    if (options.iconCustomEmojiId) {
+      form.icon_custom_emoji_id = String(options.iconCustomEmojiId).trim();
+    }
+
+    try {
+      return await this.bot.createForumTopic(targetChatId, normalizedName, form);
+    } catch (error) {
+      throw toTelegramError(error, 'Failed to create Telegram forum topic');
+    }
+  }
+
   async getUpdates(cursor, timeout = 20) {
     const opts = {
       timeout: Number.isFinite(timeout) ? Math.max(1, Math.min(50, timeout)) : 20,
@@ -342,6 +382,9 @@ class TelegramApi {
         const requestOptions = {
           parse_mode: 'HTML',
         };
+        if (Number.isInteger(options.messageThreadId)) {
+          requestOptions.message_thread_id = options.messageThreadId;
+        }
         if (index === chunks.length - 1 && options.replyMarkup) {
           requestOptions.reply_markup = options.replyMarkup;
         }

@@ -92,10 +92,22 @@ Reset Telegram bot token and pairing:
 ushagent reset
 ```
 
+Remove the entire local UshAgent config:
+
+```bash
+ushagent reset-config
+```
+
 Non-interactive reset:
 
 ```bash
 ushagent reset --yes
+```
+
+Non-interactive full config reset:
+
+```bash
+ushagent reset-config --yes
 ```
 
 Install a background Linux service for this project:
@@ -110,7 +122,7 @@ ushagent service install
 2. Pair the Telegram bot if this is the first launch.
 3. Keep the process running in the terminal.
 4. Send messages from Telegram or type directly into the local terminal.
-5. The bridge forwards prompts to Codex and sends responses back to Telegram.
+5. The bridge forwards Telegram prompts to Codex and sends responses back to Telegram.
 
 ## Local Terminal Commands
 
@@ -120,8 +132,8 @@ While `ushagent codex` is running, you can type:
 /help
 /status
 /new
+/reset
 /stop
-/ask <prompt>
 /say <text>
 /projects
 /project <number|path|current>
@@ -130,7 +142,8 @@ While `ushagent codex` is running, you can type:
 /exit
 ```
 
-Plain text without a slash is treated as a prompt for the active agent.
+Local terminal input is command-only. Send prompts to Codex from Telegram.
+`/new` resets only the next Codex session. `/reset` removes the local UshAgent config and stops the bridge.
 
 ## Telegram Commands
 

@@ -33,6 +33,8 @@ export function runProcess(command, args, options = {}) {
   const cwd = options.cwd || process.cwd();
   const signal = options.signal || null;
   const input = options.input === undefined || options.input === null ? null : String(options.input);
+  const onStdoutChunk = typeof options.onStdoutChunk === 'function' ? options.onStdoutChunk : null;
+  const onStderrChunk = typeof options.onStderrChunk === 'function' ? options.onStderrChunk : null;
   const spawnTarget = resolveProcessSpawn(command, args);
 
   return new Promise((resolve, reject) => {
@@ -79,11 +81,19 @@ export function runProcess(command, args, options = {}) {
     }, timeoutMs);
 
     child.stdout.on('data', chunk => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      if (onStdoutChunk) {
+        onStdoutChunk(text);
+      }
     });
 
     child.stderr.on('data', chunk => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      if (onStderrChunk) {
+        onStderrChunk(text);
+      }
     });
 
     if (input !== null && child.stdin) {

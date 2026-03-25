@@ -32,6 +32,23 @@ test('sendMessage uses HTML parse mode for Telegram formatting', async () => {
   assert.match(request.text, /Run <code>npm test<\/code>/);
 });
 
+test('sendMessage includes message thread id when provided', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  let request = null;
+  api.bot = {
+    sendMessage: async (chatId, text, options) => {
+      request = { chatId, text, options };
+      return { message_id: 1 };
+    },
+  };
+
+  await api.sendMessage('chat-1', 'Threaded', {
+    messageThreadId: 321,
+  });
+
+  assert.equal(request.options.message_thread_id, 321);
+});
+
 test('setMyCommands passes normalized commands to Telegram', async () => {
   const api = new TelegramApi('123456:token_token_token_token');
   let request = null;
@@ -52,4 +69,47 @@ test('setMyCommands passes normalized commands to Telegram', async () => {
     { command: 'help', description: 'Show help' },
     { command: 'status', description: 'Show status' },
   ]);
+});
+
+test('createForumTopic delegates to Telegram bot API', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  let request = null;
+  api.bot = {
+    createForumTopic: async (chatId, name, options) => {
+      request = { chatId, name, options };
+      return { message_thread_id: 55, name };
+    },
+  };
+
+  const result = await api.createForumTopic('chat-1', 'HOST: DESKTOP', {
+    iconColor: 0x6fb9f0,
+  });
+
+  assert.equal(request.chatId, 'chat-1');
+  assert.equal(request.name, 'HOST: DESKTOP');
+  assert.equal(request.options.icon_color, 0x6fb9f0);
+  assert.equal(result.message_thread_id, 55);
+});
+
+test('editMessageText does not send message thread id to Telegram', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  let request = null;
+  api.bot = {
+    editMessageText: async (text, options) => {
+      request = { text, options };
+      return { ok: true };
+    },
+  };
+
+  await api.editMessageText('chat-1', 123, 'Updated text', {
+    messageThreadId: 321,
+    replyMarkup: { inline_keyboard: [[{ text: 'OK', callback_data: 'ok' }]] },
+  });
+
+  assert.equal(request.options.chat_id, 'chat-1');
+  assert.equal(request.options.message_id, 123);
+  assert.equal(request.options.message_thread_id, undefined);
+  assert.deepEqual(request.options.reply_markup, {
+    inline_keyboard: [[{ text: 'OK', callback_data: 'ok' }]],
+  });
 });

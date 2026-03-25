@@ -88,6 +88,8 @@ export function createProviderRuntime(config, provider, providerArgs = []) {
         onSessionId: sessionId => {
           this.setSessionId(sessionId);
         },
+        onProgress: options.onProgress,
+        onRawEvent: options.onRawEvent,
       });
     },
     listSessions(options = {}) {

@@ -21,6 +21,13 @@ class FakeConfig {
       telegramBotToken: '123456:token',
       telegramBotId: '1',
       telegramControlPanelMessageId: null,
+      telegramControlPanelMessageIds: {},
+      telegramForum: {
+        enabled: false,
+        chatId: null,
+        mainThreadId: null,
+        topics: {},
+      },
     };
   }
 
@@ -55,6 +62,57 @@ class FakeConfig {
     return this._data;
   }
 
+  setTelegramForum(data = {}) {
+    this._data.telegramForum = {
+      ...this._data.telegramForum,
+      ...data,
+      topics:
+        data.topics && typeof data.topics === 'object' && !Array.isArray(data.topics)
+          ? { ...data.topics }
+          : this._data.telegramForum.topics,
+    };
+    return this._data;
+  }
+
+  setTelegramTopic(topicKey, topicRecord = {}) {
+    this._data.telegramForum = {
+      ...this._data.telegramForum,
+      topics: {
+        ...this._data.telegramForum.topics,
+        [topicKey]: {
+          ...(this._data.telegramForum.topics[topicKey] || {}),
+          ...topicRecord,
+        },
+      },
+    };
+    return this._data;
+  }
+
+  getTelegramControlPanelMessageId(slotKey = 'default') {
+    const key = String(slotKey || 'default').trim() || 'default';
+    const mapped = this._data.telegramControlPanelMessageIds[key];
+    if (Number.isInteger(mapped)) {
+      return mapped;
+    }
+
+    return key === 'default' ? this._data.telegramControlPanelMessageId : null;
+  }
+
+  setTelegramControlPanelMessageId(slotKey = 'default', messageId = null) {
+    const key = String(slotKey || 'default').trim() || 'default';
+    if (Number.isInteger(messageId)) {
+      this._data.telegramControlPanelMessageIds[key] = messageId;
+    } else {
+      delete this._data.telegramControlPanelMessageIds[key];
+    }
+
+    if (key === 'default') {
+      this._data.telegramControlPanelMessageId = Number.isInteger(messageId) ? messageId : null;
+    }
+
+    return this._data;
+  }
+
   clearPairing(options = {}) {
     this._data.telegramChatId = null;
     this._data.telegramChatUserId = null;
@@ -62,6 +120,31 @@ class FakeConfig {
     if (options.keepBotToken !== true) {
       this._data.telegramBotToken = null;
     }
+    return this._data;
+  }
+
+  resetAll() {
+    this._data = {
+      provider: null,
+      codexArgs: [],
+      codexLastSessionId: null,
+      activeWorkspacePath: null,
+      workspaces: {},
+      telegramChatId: null,
+      telegramChatUserId: null,
+      telegramUpdateCursor: 0,
+      telegramBotUsername: null,
+      telegramBotToken: null,
+      telegramBotId: null,
+      telegramControlPanelMessageId: null,
+      telegramControlPanelMessageIds: {},
+      telegramForum: {
+        enabled: false,
+        chatId: null,
+        mainThreadId: null,
+        topics: {},
+      },
+    };
     return this._data;
   }
 
@@ -115,6 +198,14 @@ class FakeConfig {
 
   get telegramControlPanelMessageId() {
     return this._data.telegramControlPanelMessageId;
+  }
+
+  get telegramControlPanelMessageIds() {
+    return this._data.telegramControlPanelMessageIds;
+  }
+
+  get telegramForum() {
+    return this._data.telegramForum;
   }
 }
 
@@ -280,6 +371,300 @@ test('publishTelegramView persists control panel message id from sent message', 
   }
 });
 
+test('publishTelegramView persists forum control panel ids per thread', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {},
+    };
+    bridge.telegramThreadId = 30;
+    bridge.safeSendMessage = async () => ({ message_id: 99 });
+
+    await bridge.publishTelegramView('main panel', {
+      persistMenu: true,
+      messageThreadId: 10,
+      replyMarkup: bridge.buildMainKeyboard(),
+    });
+
+    await bridge.publishTelegramView('project panel', {
+      persistMenu: true,
+      messageThreadId: 30,
+      replyMarkup: bridge.buildControlKeyboard(),
+    });
+
+    assert.equal(config.getTelegramControlPanelMessageId('thread:10'), 99);
+    assert.equal(config.getTelegramControlPanelMessageId('thread:30'), 99);
+    assert.equal(config.telegramControlPanelMessageId, null);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('pollOnce routes forum callback queries before topic command handlers', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {},
+    };
+    bridge.telegram = {
+      getUpdates: async () => ({
+        nextCursor: 1,
+        messages: [
+          {
+            type: 'callback',
+            chatId: 'chat-1',
+            userId: 'user-1',
+            messageId: 44,
+            messageThreadId: 10,
+            callbackQueryId: 'cb-1',
+            data: 'hosts',
+            text: 'hosts',
+          },
+        ],
+      }),
+    };
+
+    let callbackData = null;
+    bridge.handleCallbackAction = async data => {
+      callbackData = data;
+    };
+    bridge.handleMainTopicMessage = async () => {
+      throw new Error('main topic handler should not receive callback queries');
+    };
+
+    await bridge.pollOnce();
+
+    assert.equal(callbackData, 'hosts');
+    assert.equal(config.telegramUpdateCursor, 1);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('ensureTelegramForumContext starts in host control mode without creating project topic', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    const createdTopics = [];
+    bridge.telegram = {
+      getChat: async () => ({ is_forum: true }),
+      createForumTopic: async (_chatId, title) => {
+        createdTopics.push(title);
+        return { message_thread_id: createdTopics.length + 9 };
+      },
+    };
+
+    await bridge.ensureTelegramForumContext('chat-1');
+
+    assert.deepEqual(createdTopics, ['MAIN', `HOST: ${os.hostname()}`]);
+    assert.equal(bridge.telegramForumState.projectThreadId, null);
+    assert.equal(bridge.telegramThreadId, bridge.telegramForumState.hostThreadId);
+    assert.equal(config.telegramForum.topics.main.title, 'MAIN');
+    assert.equal(config.telegramForum.topics[`host:${os.hostname().trim().toLowerCase()}`].kind, 'host');
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('forum switch_project callback opens workspace browser', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const otherProject = path.join(tmpDir, 'project-b');
+  mkdirSync(otherProject);
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    config.setWorkspace(otherProject, {
+      label: 'project-b',
+      provider: 'codex',
+      codexArgs: config.codexArgs,
+      codexLastSessionId: null,
+      sessionMode: 'latest',
+      pinnedSessionId: null,
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {},
+    };
+
+    let published = null;
+    bridge.publishTelegramView = async (text, options) => {
+      published = { text, options };
+    };
+    bridge.telegram = {
+      answerCallbackQuery: async () => null,
+    };
+
+    await bridge.handleCallbackAction('forum:switch_project', 'cb-1', 44, 30);
+
+    assert.match(published.text, /Known workspaces/);
+    assert.match(published.text, /topic missing/);
+    assert.ok(Array.isArray(published.options.replyMarkup.inline_keyboard));
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('handleProjectSwitchCommand ensures forum topic for switched workspace', async () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const projectA = path.join(rootDir, 'project-a');
+  const projectB = path.join(rootDir, 'project-b');
+  mkdirSync(projectA);
+  mkdirSync(projectB);
+
+  const previousCwd = process.cwd();
+  process.chdir(projectA);
+
+  try {
+    const { bridge, config } = createBridge(projectA);
+    config.setWorkspace(projectB, {
+      label: 'project-b',
+      provider: 'codex',
+      codexArgs: config.codexArgs,
+      codexLastSessionId: null,
+      sessionMode: 'latest',
+      pinnedSessionId: null,
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {},
+    };
+    bridge.telegramThreadId = 30;
+
+    let ensuredWorkspace = null;
+    bridge.ensureTelegramProjectTopic = async (_chatId, workspacePath) => {
+      ensuredWorkspace = workspacePath;
+      bridge.telegramThreadId = 77;
+      bridge.telegramForumState.projectThreadId = 77;
+      return { threadId: 77, title: 'HOST | project-b' };
+    };
+
+    let published = null;
+    bridge.publishTelegramView = async (text, options) => {
+      published = { text, options };
+    };
+
+    await bridge.handleProjectSwitchCommand(projectB, 'telegram', {
+      messageId: 44,
+      messageThreadId: 30,
+      persistMenu: true,
+    });
+
+    assert.equal(ensuredWorkspace, projectB);
+    assert.equal(bridge.telegramThreadId, 77);
+    assert.match(published.text, /Topic thread: 77/);
+    assert.equal(published.options.messageThreadId, 77);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('pollOnce switches workspace when message arrives in another project topic', async () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const projectA = path.join(rootDir, 'project-a');
+  const projectB = path.join(rootDir, 'project-b');
+  mkdirSync(projectA);
+  mkdirSync(projectB);
+
+  const previousCwd = process.cwd();
+  process.chdir(projectA);
+
+  try {
+    const { bridge, config } = createBridge(projectA);
+    config.setWorkspace(projectB, {
+      label: 'project-b',
+      provider: 'codex',
+      codexArgs: config.codexArgs,
+      codexLastSessionId: null,
+      sessionMode: 'latest',
+      pinnedSessionId: null,
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {
+        'project:host:a': {
+          kind: 'project',
+          threadId: 30,
+          title: 'HOST | project-a',
+          hostname: os.hostname(),
+          workspacePath: projectA,
+        },
+        'project:host:b': {
+          kind: 'project',
+          threadId: 77,
+          title: 'HOST | project-b',
+          hostname: os.hostname(),
+          workspacePath: projectB,
+        },
+      },
+    };
+    bridge.telegramThreadId = 30;
+    bridge.telegram = {
+      getUpdates: async () => ({
+        nextCursor: 1,
+        messages: [
+          {
+            type: 'text',
+            chatId: 'chat-1',
+            userId: 'user-1',
+            messageId: 55,
+            messageThreadId: 77,
+            text: 'hello from project b',
+          },
+        ],
+      }),
+    };
+
+    let handledText = null;
+    bridge.handleMessage = async text => {
+      handledText = text;
+    };
+
+    await bridge.pollOnce();
+
+    assert.equal(handledText, 'hello from project b');
+    assert.equal(process.cwd(), projectB);
+    assert.equal(bridge.telegramThreadId, 77);
+    assert.equal(config.activeWorkspacePath, projectB);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('safeSendMessage returns sent Telegram message so menu state can persist', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
@@ -346,6 +731,120 @@ test('handleCommand accepts Telegram commands with bot mention suffix', async ()
     await bridge.handleCommand('/menu@botname');
 
     assert.equal(opened, true);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('local /reset clears config and stops the bridge', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    const sent = [];
+    bridge.safeSendMessage = async text => {
+      sent.push(text);
+      return { message_id: 1 };
+    };
+    bridge.stopLocalInputLoop = () => {
+      bridge.localInputInterface = null;
+    };
+
+    await bridge.handleLocalInputLine('/reset');
+
+    assert.equal(bridge.running, false);
+    assert.equal(config.provider, null);
+    assert.equal(config.telegramChatId, null);
+    assert.match(sent[0], /Restart setup on next launch/);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('local /addclient prints join-client bootstrap command', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    config.setMany({
+      provider: 'codex',
+      telegramChatId: '-1001',
+      telegramBotToken: '123456:token_token_token_token',
+      telegramBotUsername: 'forumbot',
+    });
+    config.setTelegramForum({
+      enabled: true,
+      chatId: '-1001',
+      mainThreadId: 10,
+      topics: {},
+    });
+
+    const lines = [];
+    bridge.writeCliLine = line => {
+      lines.push(line);
+    };
+
+    await bridge.handleLocalInputLine('/addclient');
+
+    assert.equal(lines[0], 'Run this on the other computer:');
+    assert.match(lines[1], /ushagent join-client --bundle ".+" --yes/);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('runPairingFlow supports forum pairing from a supergroup topic chat', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    bridge.running = true;
+    config.setMany({
+      telegramUpdateCursor: 0,
+      telegramBotUsername: 'forumbot',
+      telegramChatId: null,
+      telegramChatUserId: null,
+    });
+
+    let sent = null;
+    bridge.telegram = {
+      getUpdates: async () => ({
+        nextCursor: 2,
+        messages: [
+          {
+            chatId: '-1001',
+            chatType: 'supergroup',
+            userId: 'user-1',
+            text: '/help@forumbot',
+          },
+        ],
+      }),
+      getChat: async chatId => ({
+        id: chatId,
+        is_forum: true,
+      }),
+      sendMessage: async (chatId, text) => {
+        sent = { chatId, text };
+      },
+    };
+
+    const pairing = await bridge.runPairingFlow({
+      mode: 'manual',
+      chatMode: 'forum',
+    });
+
+    assert.equal(pairing.chatId, '-1001');
+    assert.equal(config.telegramChatId, '-1001');
+    assert.equal(config.telegramChatUserId, null);
+    assert.equal(config.telegramUpdateCursor, 2);
+    assert.equal(sent.chatId, '-1001');
+    assert.match(sent.text, /forum mode/i);
   } finally {
     process.chdir(previousCwd);
   }

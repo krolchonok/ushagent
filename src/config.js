@@ -36,8 +36,15 @@ class Config {
       telegramChatId: null,
       telegramChatUserId: null,
       telegramControlPanelMessageId: null,
+      telegramControlPanelMessageIds: {},
       telegramUpdateCursor: 0,
       codexLastSessionId: null,
+      telegramForum: {
+        enabled: false,
+        chatId: null,
+        mainThreadId: null,
+        topics: {},
+      },
     };
     this._data = { ...this.defaults };
     this.load();
@@ -158,8 +165,25 @@ class Config {
     return Number.isInteger(value) ? value : null;
   }
 
+  get telegramControlPanelMessageIds() {
+    const value = this._data.telegramControlPanelMessageIds ?? this.defaults.telegramControlPanelMessageIds;
+    return value && typeof value === 'object' && !Array.isArray(value) ? { ...value } : {};
+  }
+
   get codexLastSessionId() {
     return this._data.codexLastSessionId ?? this.defaults.codexLastSessionId;
+  }
+
+  get telegramForum() {
+    const value = this._data.telegramForum ?? this.defaults.telegramForum;
+    const topics =
+      value?.topics && typeof value.topics === 'object' && !Array.isArray(value.topics) ? { ...value.topics } : {};
+    return {
+      enabled: value?.enabled === true,
+      chatId: value?.chatId ?? null,
+      mainThreadId: Number.isInteger(value?.mainThreadId) ? value.mainThreadId : null,
+      topics,
+    };
   }
 
   isPaired() {
@@ -217,8 +241,81 @@ class Config {
       telegramChatId: null,
       telegramChatUserId: null,
       telegramControlPanelMessageId: null,
+      telegramControlPanelMessageIds: {},
       telegramUpdateCursor: 0,
       codexLastSessionId: null,
+      telegramForum: this.defaults.telegramForum,
+    });
+  }
+
+  resetAll() {
+    this._data = { ...this.defaults };
+
+    if (fs.existsSync(this.configPath)) {
+      fs.unlinkSync(this.configPath);
+    }
+
+    return this._data;
+  }
+
+  getTelegramControlPanelMessageId(slotKey = 'default') {
+    const key = String(slotKey || 'default').trim() || 'default';
+    const mapped = this.telegramControlPanelMessageIds[key];
+    if (Number.isInteger(mapped)) {
+      return mapped;
+    }
+
+    return key === 'default' ? this.telegramControlPanelMessageId : null;
+  }
+
+  setTelegramControlPanelMessageId(slotKey = 'default', messageId = null) {
+    const key = String(slotKey || 'default').trim() || 'default';
+    const next = { ...this.telegramControlPanelMessageIds };
+
+    if (Number.isInteger(messageId)) {
+      next[key] = messageId;
+    } else {
+      delete next[key];
+    }
+
+    return this.save({
+      telegramControlPanelMessageId: key === 'default' ? (Number.isInteger(messageId) ? messageId : null) : this.telegramControlPanelMessageId,
+      telegramControlPanelMessageIds: next,
+    });
+  }
+
+  setTelegramForum(data = {}) {
+    const current = this.telegramForum;
+    const next = {
+      ...current,
+      ...data,
+      topics:
+        data.topics && typeof data.topics === 'object' && !Array.isArray(data.topics)
+          ? { ...data.topics }
+          : current.topics,
+    };
+
+    return this.save({
+      telegramForum: next,
+    });
+  }
+
+  setTelegramTopic(topicKey, topicRecord = {}) {
+    const key = String(topicKey || '').trim();
+    if (!key) {
+      throw new Error('Telegram topic key is required.');
+    }
+
+    const current = this.telegramForum;
+    return this.setTelegramForum({
+      ...current,
+      topics: {
+        ...current.topics,
+        [key]: {
+          ...(current.topics[key] || {}),
+          ...topicRecord,
+        },
+      },
     });
   }
 }

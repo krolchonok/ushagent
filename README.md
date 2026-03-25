@@ -37,8 +37,20 @@ ushagent status
 # Reset Telegram setup (clears bot token + chat pairing)
 ushagent reset
 
+# Remove the entire local UshAgent config
+ushagent reset-config
+
+# Generate bootstrap command for another forum-mode client
+ushagent addclient
+
+# Apply bootstrap bundle on another computer
+ushagent join-client --bundle "<bundle>"
+
 # Non-interactive reset
 ushagent reset --yes
+
+# Non-interactive full config reset
+ushagent reset-config --yes
 
 # Install background service for this project
 ushagent service install
@@ -79,19 +91,24 @@ On first run, UshAgent will:
 1. Ask for setup mode:
    - **Phone setup** (recommended) — scan one QR code and complete guided steps on your phone
    - **Manual fallback** — no tunnel required; paste the bot token directly into the terminal
-2. In phone setup mode, CLI starts a temporary local server exposed via a Cloudflare Quick Tunnel and shows a single QR code. (This same tool is handy for reaching your local dev environment from your phone.)
-3. Complete guided steps on phone:
+2. Ask for Telegram chat mode:
+   - **Private chat** — pair with the bot in direct messages
+   - **Forum topics** — pair with a Telegram supergroup that has Topics enabled
+3. In phone setup mode, CLI starts a temporary local server exposed via a Cloudflare Quick Tunnel and shows a single QR code. (This same tool is handy for reaching your local dev environment from your phone.)
+4. Complete guided steps on phone:
    - Open BotFather
    - Create your own bot
    - Submit bot token
-   - Open bot chat and press START
-4. CLI validates token, waits for pairing, and stores bot + chat locally.
+   - For **Private chat**: open bot chat and press START
+   - For **Forum topics**: add the bot to a supergroup with Topics enabled, then send `/start@YourBot` or `/help@YourBot` in that forum chat
+5. CLI validates token, waits for pairing, and stores bot + chat locally.
 
 Manual fallback avoids tunneling completely:
 
 1. Create your own bot
 2. Paste bot token into the terminal.
-3. CLI shows bot opening link/QR for pairing.
+3. Choose **Private chat** or **Forum topics**.
+4. Follow the printed pairing instructions for that mode.
 
 If recommended phone onboarding fails in your environment, install system `cloudflared`
 (for example `brew install cloudflared` on macOS or `winget install Cloudflare.cloudflared` on Windows) or choose manual fallback.
@@ -103,7 +120,8 @@ If recommended phone onboarding fails in your environment, install system `cloud
   - a random per-session path
   - a second per-session secret in the URL fragment, required for token submission and state polling
 - The QR/onboarding flow validates the token directly against Telegram before continuing.
-- Pairing only succeeds from a private Telegram chat by pressing `START` on the bot deep link generated for the current session.
+- Private mode pairs from a direct bot chat by pressing `START` on the bot deep link generated for the current session.
+- Forum mode pairs from a Telegram supergroup with Topics enabled after the bot is added and receives a command like `/start@YourBot` or `/help@YourBot`.
 
 ## Telegram Commands
 
@@ -121,13 +139,13 @@ For voice input, keyboard dictation on your phone is recommended.
 
 When running in an interactive terminal, UshAgent also accepts live local input.
 
-- Plain text: run prompt through provider and send response to Telegram
-- `/ask <prompt>` same as plain text
 - `/say <text>` send raw message directly to Telegram
 - `/new` force next prompt to start a fresh session
 - `/stop` stop current execution and clear queued Telegram messages
 - `/projects` list known projects
 - `/project <number|path|current>` switch or inspect active project
+
+Local CLI is command-only. Send prompts to Codex from Telegram.
 - `/sessions` show sessions for the current project
 - `/session` show current session binding and next prompt mode
 - `/status` print local bridge status

@@ -7,6 +7,47 @@ export function getCodexCommand() {
   return process.platform === 'win32' ? 'codex.cmd' : 'codex';
 }
 
+export function parseCodexProgressEvent(line) {
+  if (!String(line || '').trim().startsWith('{')) {
+    return null;
+  }
+
+  try {
+    const event = JSON.parse(line);
+
+    if (event.type === 'thread.started') {
+      const threadId = pickValue(event.thread_id);
+      return threadId ? { kind: 'session', sessionId: threadId } : null;
+    }
+
+    if (event.type === 'event_msg' && event.payload?.type === 'agent_message') {
+      const message = pickValue(event.payload?.message);
+      const phase = pickValue(event.payload?.phase);
+      if (message) {
+        return {
+          kind: 'progress',
+          text: message,
+          phase: phase || null,
+        };
+      }
+    }
+
+    if (event.type === 'response_item' && event.payload?.type === 'function_call') {
+      const toolName = pickValue(event.payload?.name);
+      if (toolName) {
+        return {
+          kind: 'tool',
+          text: `Running ${toolName}`,
+        };
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
 export function buildCodexArgs(prompt, options = {}) {
   const resume = Boolean(options.resume);
   const extraArgs = Array.isArray(options.extraArgs) ? options.extraArgs : [];
@@ -213,6 +254,8 @@ function parseCodexJsonLines(rawText) {
 export async function runCodexPrompt(prompt, options = {}) {
   const sessionId = pickValue(options.sessionId);
   const onSessionId = typeof options.onSessionId === 'function' ? options.onSessionId : null;
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const onRawEvent = typeof options.onRawEvent === 'function' ? options.onRawEvent : null;
   const cwd = options.cwd || process.cwd();
   const abortSignal = options.abortSignal || null;
   const resume = Boolean(options.resume);
@@ -226,11 +269,37 @@ export async function runCodexPrompt(prompt, options = {}) {
   });
 
   try {
+    let stdoutBuffer = '';
     const result = await runProcess(getCodexCommand(), args, {
       cwd,
       timeoutMs: 20 * 60 * 1000,
       signal: abortSignal,
       input: prompt,
+      onStdoutChunk: chunk => {
+        stdoutBuffer += chunk;
+        const lines = stdoutBuffer.split(/\r?\n/);
+        stdoutBuffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (onRawEvent && String(line || '').trim().startsWith('{')) {
+            onRawEvent(line);
+          }
+
+          const progressEvent = parseCodexProgressEvent(line);
+          if (!progressEvent) {
+            continue;
+          }
+
+          if (progressEvent.kind === 'session' && progressEvent.sessionId && onSessionId) {
+            onSessionId(progressEvent.sessionId);
+            continue;
+          }
+
+          if ((progressEvent.kind === 'progress' || progressEvent.kind === 'tool') && progressEvent.text && onProgress) {
+            onProgress(progressEvent.text, progressEvent);
+          }
+        }
+      },
     });
 
     const parsed = parseCodexJsonLines(result.stdout || '');

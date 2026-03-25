@@ -12,6 +12,7 @@ import Logger from './logger.js';
 import { TelegramApi, TelegramApiError } from './telegram-api.js';
 import { createOnboardingSession } from './token-web-intake.js';
 import { applyDefaultBypassArgs } from './args.js';
+import { createClientBootstrapBundle } from './client-bootstrap.js';
 import { formatSleepInhibitorStatus, startSleepInhibitor } from './sleep-inhibitor.js';
 import { createAttachmentHandler } from './attachment-handler.js';
 import { collectKnownWorkspaces, formatWorkspaceList } from './workspace-manager.js';
@@ -26,6 +27,8 @@ import {
 const BOTFATHER_URL = 'https://t.me/BotFather';
 const SETUP_MODE_PHONE = 'phone_onboarding';
 const SETUP_MODE_MANUAL = 'manual_fallback';
+const TELEGRAM_CHAT_MODE_PRIVATE = 'private';
+const TELEGRAM_CHAT_MODE_FORUM = 'forum';
 const ATTACHMENT_DOWNLOAD_DIR = path.join(os.tmpdir(), 'ushagent-files');
 const DICTATION_HINT_TEXT = 'Hint: for voice input, use your phone keyboard dictation.';
 const MAX_CONVERSATION_HISTORY = 40;
@@ -46,6 +49,35 @@ const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: 'last', description: 'Show the last completed exchange' },
   { command: 'stop', description: 'Stop current execution and clear queue' },
 ]);
+const MAIN_TOPIC_KEY = 'main';
+const DEBUG_CODEX_STREAM = /^(1|true|yes|on)$/i.test(String(process.env.USHAGENT_CODEX_DEBUG_STREAM || '').trim());
+
+function sanitizeTopicSegment(value, fallback = 'unknown') {
+  const normalized = String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ');
+  return normalized || fallback;
+}
+
+function getHostTopicKey(hostname = os.hostname()) {
+  return `host:${String(hostname || '').trim().toLowerCase()}`;
+}
+
+function getProjectTopicKey(workspacePath, hostname = os.hostname()) {
+  return `project:${String(hostname || '').trim().toLowerCase()}:${String(workspacePath || '').trim().toLowerCase()}`;
+}
+
+function buildHostTopicTitle(hostname = os.hostname()) {
+  return `HOST: ${sanitizeTopicSegment(hostname, 'HOST')}`;
+}
+
+function buildProjectTopicTitle(workspacePath, hostname = os.hostname()) {
+  return `${sanitizeTopicSegment(hostname, 'HOST')} | ${sanitizeTopicSegment(path.basename(workspacePath) || workspacePath, 'project')}`;
+}
+
+function formatWorkspaceLabel(workspacePath) {
+  return path.basename(workspacePath) || workspacePath;
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -130,6 +162,21 @@ function toLogPreview(text) {
   return `${singleLine.slice(0, 239)}…`;
 }
 
+function summarizeCodexEventLine(line) {
+  const normalized = String(line || '').trim();
+  if (!normalized.startsWith('{')) {
+    return toLogPreview(normalized);
+  }
+
+  try {
+    const event = JSON.parse(normalized);
+    const eventType = typeof event?.type === 'string' ? event.type : 'unknown';
+    return `${eventType}: ${toLogPreview(normalized)}`;
+  } catch {
+    return toLogPreview(normalized);
+  }
+}
+
 function normalizeTelegramCommand(rawCommand) {
   const value = String(rawCommand || '').trim().toLowerCase();
   if (!value.startsWith('/')) {
@@ -180,6 +227,8 @@ class Bridge {
     this.lastExchange = null;
     this.conversationHistory = [];
     this.isStopping = false;
+    this.telegramForumState = null;
+    this.telegramThreadId = null;
 
     this.onSignal = () => {
       if (this.isStopping) {
@@ -210,6 +259,7 @@ class Bridge {
       await mkdir(ATTACHMENT_DOWNLOAD_DIR, { recursive: true });
 
       const pairing = await this.ensureBridgeReady();
+      await this.ensureTelegramForumContext(pairing.chatId);
       this.attachmentHandler = await createAttachmentHandler({
         telegram: this.telegram,
         downloadDir: ATTACHMENT_DOWNLOAD_DIR,
@@ -229,18 +279,22 @@ class Bridge {
       console.log(`UshAgent is running in ${this.provider} mode. Send /help in Telegram.\n`);
 
       const providerLabel = formatProviderName(this.provider);
-      const startupHeadline =
-        this.startMode === 'new'
+      const startupHeadline = this.telegramForumState?.enabled
+        ? `UshAgent connected in host control mode for ${os.hostname()}. Use this topic to manage projects.`
+        : this.startMode === 'new'
           ? `UshAgent connected. Next message starts a new ${providerLabel} session.`
           : this.initialSessionId
             ? `UshAgent connected to ${providerLabel} session ${this.initialSessionId}.`
             : `UshAgent connected. Next message resumes ${this.describeResumeTarget(this.getBoundSessionId())}.`;
 
       const startupMessage = await this.safeSendMessage([startupHeadline, 'Send /help for available commands.', DICTATION_HINT_TEXT].join('\n\n'), {
-        replyMarkup: this.buildControlKeyboard(),
+        replyMarkup: this.getReplyMarkupForThread(this.getActiveTelegramThreadId()),
       });
       if (Number.isInteger(startupMessage?.message_id)) {
-        this.config.set('telegramControlPanelMessageId', startupMessage.message_id);
+        this.config.setTelegramControlPanelMessageId(
+          this.getControlPanelSlotKey(this.getActiveTelegramThreadId()),
+          startupMessage.message_id
+        );
       }
 
       this.startLocalInputLoop();
@@ -269,6 +323,200 @@ class Bridge {
     }
 
     console.log(message);
+  }
+
+  isForumModeEnabled() {
+    return this.telegramForumState?.enabled === true && Number.isInteger(this.telegramThreadId);
+  }
+
+  getActiveTelegramThreadId() {
+    return this.isForumModeEnabled() ? this.telegramThreadId : null;
+  }
+
+  getForumTopics() {
+    return this.telegramForumState?.topics || this.config.telegramForum?.topics || {};
+  }
+
+  findForumTopicByThreadId(threadId) {
+    if (!Number.isInteger(threadId)) {
+      return null;
+    }
+
+    for (const [topicKey, topic] of Object.entries(this.getForumTopics())) {
+      if (topic?.threadId === threadId) {
+        return {
+          key: topicKey,
+          ...topic,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  listForumTopicsByKind(kind, options = {}) {
+    const topics = Object.entries(this.getForumTopics())
+      .filter(([, topic]) => topic?.kind === kind)
+      .map(([key, topic]) => ({
+        key,
+        ...topic,
+      }));
+
+    const hostname = String(options.hostname || '').trim().toLowerCase();
+    if (!hostname) {
+      return topics;
+    }
+
+    return topics.filter(topic => String(topic.hostname || '').trim().toLowerCase() === hostname);
+  }
+
+  async ensureTelegramForumContext(chatId) {
+    if (!this.telegram || !chatId) {
+      this.telegramForumState = null;
+      this.telegramThreadId = null;
+      return null;
+    }
+
+    const chat = await this.telegram.getChat(chatId);
+    if (chat?.is_forum !== true) {
+      this.telegramForumState = {
+        enabled: false,
+        chatId,
+        mainThreadId: null,
+        topics: {},
+      };
+      this.telegramThreadId = null;
+      this.config.setTelegramForum(this.telegramForumState);
+      return this.telegramForumState;
+    }
+
+    const hostname = os.hostname();
+    const currentForum = this.config.telegramForum;
+    const topics = { ...currentForum.topics };
+
+    const ensureTopic = async (topicKey, title, extra = {}) => {
+      const existing = topics[topicKey];
+      if (Number.isInteger(existing?.threadId)) {
+        return existing;
+      }
+
+      const created = await this.telegram.createForumTopic(chatId, title);
+      const threadId = Number.isInteger(created?.message_thread_id)
+        ? created.message_thread_id
+        : Number.isInteger(created?.messageThreadId)
+          ? created.messageThreadId
+          : null;
+      if (!Number.isInteger(threadId)) {
+        throw new Error(`Telegram did not return a thread id for topic ${title}`);
+      }
+
+      const record = {
+        threadId,
+        title,
+        updatedAt: new Date().toISOString(),
+        ...extra,
+      };
+      topics[topicKey] = record;
+      return record;
+    };
+
+    const mainTopic = await ensureTopic(MAIN_TOPIC_KEY, 'MAIN', {
+      kind: 'main',
+    });
+    const hostTopicKey = getHostTopicKey(hostname);
+    const hostTopic = await ensureTopic(hostTopicKey, buildHostTopicTitle(hostname), {
+      kind: 'host',
+      hostname,
+    });
+
+    this.telegramForumState = {
+      enabled: true,
+      chatId,
+      mainThreadId: mainTopic.threadId,
+      topics,
+      hostTopicKey,
+      hostThreadId: hostTopic.threadId,
+      projectTopicKey: null,
+      projectThreadId: null,
+    };
+    this.telegramThreadId = hostTopic.threadId;
+    this.config.setTelegramForum({
+      enabled: true,
+      chatId,
+      mainThreadId: mainTopic.threadId,
+      topics,
+    });
+
+    return this.telegramForumState;
+  }
+
+  async ensureTelegramProjectTopic(chatId, workspacePath, hostname = os.hostname()) {
+    if (!this.telegram || !chatId) {
+      return null;
+    }
+
+    const currentForum = this.config.telegramForum;
+    const topics = { ...currentForum.topics };
+    const hostTopicKey = getHostTopicKey(hostname);
+    const projectTopicKey = getProjectTopicKey(workspacePath, hostname);
+
+    const ensureTopic = async (topicKey, title, extra = {}) => {
+      const existing = topics[topicKey];
+      if (Number.isInteger(existing?.threadId)) {
+        return existing;
+      }
+
+      const created = await this.telegram.createForumTopic(chatId, title);
+      const threadId = Number.isInteger(created?.message_thread_id)
+        ? created.message_thread_id
+        : Number.isInteger(created?.messageThreadId)
+          ? created.messageThreadId
+          : null;
+      if (!Number.isInteger(threadId)) {
+        throw new Error(`Telegram did not return a thread id for topic ${title}`);
+      }
+
+      const record = {
+        threadId,
+        title,
+        updatedAt: new Date().toISOString(),
+        ...extra,
+      };
+      topics[topicKey] = record;
+      return record;
+    };
+
+    const hostTopic = await ensureTopic(hostTopicKey, buildHostTopicTitle(hostname), {
+      kind: 'host',
+      hostname,
+    });
+    const projectTopic = await ensureTopic(projectTopicKey, buildProjectTopicTitle(workspacePath, hostname), {
+      kind: 'project',
+      hostname,
+      workspacePath,
+      hostKey: hostTopicKey,
+    });
+
+    this.telegramForumState = {
+      ...(this.telegramForumState || currentForum),
+      enabled: true,
+      chatId,
+      mainThreadId: Number.isInteger(currentForum.mainThreadId) ? currentForum.mainThreadId : this.telegramForumState?.mainThreadId ?? null,
+      topics,
+      hostTopicKey,
+      projectTopicKey,
+      hostThreadId: hostTopic.threadId,
+      projectThreadId: projectTopic.threadId,
+    };
+    this.telegramThreadId = projectTopic.threadId;
+    this.config.setTelegramForum({
+      enabled: true,
+      chatId,
+      mainThreadId: this.telegramForumState.mainThreadId,
+      topics,
+    });
+
+    return projectTopic;
   }
 
   logCliEvent(label, text = '') {
@@ -386,15 +634,123 @@ class Bridge {
     ].join('\n');
   }
 
+  buildMainTopicText() {
+    const hostCount = this.listForumTopicsByKind('host').length;
+    const projectCount = this.listForumTopicsByKind('project').length;
+    const workspacePath = this.getCurrentWorkspacePath();
+    const currentHost = this.listForumTopicsByKind('host', {
+      hostname: os.hostname(),
+    })[0];
+    const currentProject = this.findForumTopicByThreadId(this.telegramForumState?.projectThreadId ?? this.telegramThreadId);
+    const recentProjects = this.listForumTopicsByKind('project').slice(0, 5);
+
+    return [
+      'UshAgent forum overview',
+      `Host: ${os.hostname()}`,
+      `Current project: ${path.basename(workspacePath) || workspacePath}`,
+      `Projects tracked: ${projectCount}`,
+      `Hosts tracked: ${hostCount}`,
+      currentHost ? `Host topic: ${currentHost.title}` : null,
+      currentProject ? `Project topic: ${currentProject.title}` : null,
+      '',
+      recentProjects.length > 0 ? 'Recent project topics:' : null,
+      ...recentProjects.map((project, index) => `${index + 1}. ${project.title}`),
+      '',
+      'Use /usage for limits, /hosts for machines, and /projects for project topics.',
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  buildHostTopicText(hostTopic = null) {
+    const hostname = hostTopic?.hostname || os.hostname();
+    const projects = this.listForumTopicsByKind('project', {
+      hostname,
+    });
+
+    return [
+      `Host: ${hostname}`,
+      `Projects: ${projects.length}`,
+      '',
+      ...projects.map((project, index) => `${index + 1}. ${project.title}`),
+      projects.length === 0 ? 'No project topics yet.' : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  buildForumProjectListText(options = {}) {
+    const hostname = String(options.hostname || '').trim();
+    const projects = this.listForumTopicsByKind('project', {
+      hostname,
+    });
+
+    if (projects.length === 0) {
+      return hostname ? `No project topics yet for ${hostname}.` : 'No project topics yet.';
+    }
+
+    return [
+      hostname ? `Projects for ${hostname}:` : 'All project topics:',
+      ...projects.map((project, index) => `${index + 1}. ${project.title}`),
+    ].join('\n');
+  }
+
+  buildHostListText() {
+    const hosts = this.listForumTopicsByKind('host');
+    if (hosts.length === 0) {
+      return 'No host topics yet.';
+    }
+
+    return ['Hosts:', ...hosts.map((host, index) => `${index + 1}. ${host.title}`)].join('\n');
+  }
+
+  buildCurrentHostTopicText() {
+    const hostTopic = this.listForumTopicsByKind('host', {
+      hostname: os.hostname(),
+    })[0];
+
+    if (!hostTopic) {
+      return `No host topic is registered yet for ${os.hostname()}.`;
+    }
+
+    return this.buildHostTopicText(hostTopic);
+  }
+
+  buildCurrentProjectTopicText() {
+    const workspacePath = this.getCurrentWorkspacePath();
+    const projectTopic = this.findForumTopicByThreadId(this.telegramForumState?.projectThreadId ?? this.telegramThreadId);
+
+    return [
+      `Current host: ${os.hostname()}`,
+      `Workspace: ${workspacePath}`,
+      `Topic: ${projectTopic?.title || '(not assigned yet)'}`,
+      `Thread: ${projectTopic?.threadId || '-'}`,
+      '',
+      this.buildCurrentProjectText(),
+    ].join('\n');
+  }
+
+  buildNewProjectHelpText() {
+    return [
+      'To add a project in forum mode:',
+      '1. Open `MAIN` or `HOST`.',
+      '2. Press `Add Project`.',
+      '3. Pick a known workspace from the list.',
+      '4. UshAgent will create the topic if needed.',
+      '',
+      'To actually work inside that project, switch this running process there or start UshAgent in that folder.',
+    ].join('\n');
+  }
+
   buildControlKeyboard() {
     return {
       inline_keyboard: [
         [
-          { text: 'Projects', callback_data: 'projects' },
+          { text: 'Switch Project', callback_data: 'forum:switch_project' },
           { text: 'Sessions', callback_data: 'sessions' },
         ],
         [
-          { text: 'Project', callback_data: 'project_current' },
+          { text: 'Topic Info', callback_data: 'forum:topic_info' },
           { text: 'Session', callback_data: 'session_status' },
         ],
         [
@@ -402,12 +758,71 @@ class Bridge {
           { text: 'Status', callback_data: 'status' },
         ],
         [
-          { text: 'Menu', callback_data: 'menu' },
+          { text: 'Host', callback_data: 'forum:open_host' },
+          { text: 'Main', callback_data: 'forum:open_main' },
+        ],
+        [
           { text: 'Latest', callback_data: 'mode:latest' },
           { text: 'New', callback_data: 'mode:new' },
         ],
       ],
     };
+  }
+
+  buildMainKeyboard() {
+    return {
+      inline_keyboard: [
+        [
+          { text: 'Hosts', callback_data: 'hosts' },
+          { text: 'Projects', callback_data: 'projects' },
+        ],
+        [
+          { text: 'Current Host', callback_data: 'main:current_host' },
+          { text: 'Add Project', callback_data: 'forum:add_project' },
+        ],
+        [
+          { text: 'Usage', callback_data: 'usage' },
+          { text: 'Status', callback_data: 'status' },
+        ],
+        [{ text: 'Current Project', callback_data: 'main:current_project' }],
+      ],
+    };
+  }
+
+  buildHostKeyboard() {
+    return {
+      inline_keyboard: [
+        [
+          { text: 'Projects', callback_data: 'projects' },
+          { text: 'Add Project', callback_data: 'forum:add_project' },
+        ],
+        [
+          { text: 'Usage', callback_data: 'usage' },
+          { text: 'Status', callback_data: 'status' },
+        ],
+        [{ text: 'Main', callback_data: 'forum:open_main' }],
+      ],
+    };
+  }
+
+  getReplyMarkupForThread(messageThreadId = null) {
+    if (!this.telegramForumState?.enabled || !Number.isInteger(messageThreadId)) {
+      return this.buildControlKeyboard();
+    }
+
+    if (messageThreadId === this.telegramForumState.mainThreadId) {
+      return this.buildMainKeyboard();
+    }
+
+    if (messageThreadId === this.telegramForumState.hostThreadId) {
+      return this.buildHostKeyboard();
+    }
+
+    return this.buildControlKeyboard();
+  }
+
+  getControlPanelSlotKey(messageThreadId = null) {
+    return Number.isInteger(messageThreadId) ? `thread:${messageThreadId}` : 'default';
   }
 
   mergeReplyMarkup(...markups) {
@@ -540,20 +955,23 @@ class Bridge {
 
   async publishTelegramView(text, options = {}) {
     const persistMenu = options.persistMenu === true;
+    const targetThreadId = Number.isInteger(options.messageThreadId) ? options.messageThreadId : this.getActiveTelegramThreadId();
+    const panelSlotKey = this.getControlPanelSlotKey(targetThreadId);
     const messageId = Number.isInteger(options.messageId)
       ? options.messageId
       : persistMenu
-        ? this.config.telegramControlPanelMessageId
+        ? this.config.getTelegramControlPanelMessageId(panelSlotKey)
         : null;
-    const replyMarkup = options.replyMarkup || this.buildControlKeyboard();
+    const replyMarkup = options.replyMarkup || this.getReplyMarkupForThread(targetThreadId);
 
     if (messageId) {
       try {
         await this.telegram.editMessageText(this.config.telegramChatId, messageId, text, {
+          messageThreadId: targetThreadId,
           replyMarkup,
         });
         if (persistMenu) {
-          this.config.set('telegramControlPanelMessageId', messageId);
+          this.config.setTelegramControlPanelMessageId(panelSlotKey, messageId);
         }
         return;
       } catch {
@@ -562,11 +980,12 @@ class Bridge {
     }
 
     const sentMessage = await this.safeSendMessage(text, {
+      messageThreadId: targetThreadId,
       replyMarkup,
     });
 
     if (persistMenu && Number.isInteger(sentMessage?.message_id)) {
-      this.config.set('telegramControlPanelMessageId', sentMessage.message_id);
+      this.config.setTelegramControlPanelMessageId(panelSlotKey, sentMessage.message_id);
     }
   }
 
@@ -625,6 +1044,96 @@ class Bridge {
     return this.mergeReplyMarkup({ inline_keyboard }, this.buildControlKeyboard());
   }
 
+  buildForumWorkspaceBrowserText(options = {}) {
+    const hostname = String(options.hostname || os.hostname()).trim();
+    const workspaces = collectKnownWorkspaces(this.config, {
+      limit: 12,
+    });
+
+    this.projectListCache = workspaces;
+
+    if (workspaces.length === 0) {
+      return [
+        hostname ? `No known workspaces for ${hostname}.` : 'No known workspaces yet.',
+        'Open a project locally and run UshAgent there once to register it.',
+      ].join('\n');
+    }
+
+    return [
+      hostname ? `Known workspaces for ${hostname}:` : 'Known workspaces:',
+      ...workspaces.map((workspace, index) => {
+        const topic = this.getForumProjectTopicRecord(workspace.path, hostname);
+        const marker = workspace.path === this.getCurrentWorkspacePath() ? ' [current]' : '';
+        return `${index + 1}. ${workspace.label}${marker} - ${topic ? `topic #${topic.threadId}` : 'topic missing'}`;
+      }),
+    ].join('\n');
+  }
+
+  buildForumWorkspaceKeyboard(options = {}) {
+    const hostname = String(options.hostname || os.hostname()).trim();
+    const workspaces = Array.isArray(this.projectListCache) ? this.projectListCache : [];
+    if (workspaces.length === 0) {
+      return this.getReplyMarkupForThread(options.messageThreadId ?? null);
+    }
+
+    const inline_keyboard = [];
+    for (let index = 0; index < workspaces.length; index += 1) {
+      const workspace = workspaces[index];
+      const topic = this.getForumProjectTopicRecord(workspace.path, hostname);
+      const row = [
+        {
+          text: `${index + 1}. ${workspace.label}`,
+          callback_data: `forum:switch_project:${index + 1}`,
+        },
+      ];
+      if (!topic) {
+        row.push({
+          text: 'Create Topic',
+          callback_data: `forum:create_topic:${index + 1}`,
+        });
+      }
+      inline_keyboard.push(row);
+    }
+
+    const baseMarkup = this.getReplyMarkupForThread(options.messageThreadId ?? null);
+    return this.mergeReplyMarkup({ inline_keyboard }, baseMarkup);
+  }
+
+  getForumProjectTopicRecord(workspacePath, hostname = os.hostname()) {
+    const topicKey = getProjectTopicKey(workspacePath, hostname);
+    const topic = this.getForumTopics()[topicKey];
+    return topic && typeof topic === 'object' ? { key: topicKey, ...topic } : null;
+  }
+
+  syncForumWorkspaceForThread(messageThreadId = null) {
+    if (!this.telegramForumState?.enabled || !Number.isInteger(messageThreadId)) {
+      return null;
+    }
+
+    const topic = this.findForumTopicByThreadId(messageThreadId);
+    if (!topic || topic.kind !== 'project' || !topic.workspacePath) {
+      return topic;
+    }
+
+    this.telegramThreadId = topic.threadId;
+    this.telegramForumState = {
+      ...this.telegramForumState,
+      projectTopicKey: topic.key,
+      projectThreadId: topic.threadId,
+    };
+
+    if (topic.workspacePath !== this.getCurrentWorkspacePath() && fs.existsSync(topic.workspacePath)) {
+      this.persistWorkspaceState();
+      this.restoreWorkspaceState(topic.workspacePath);
+      this.resumeListCache = {
+        provider: this.provider,
+        sessionIds: [],
+      };
+    }
+
+    return topic;
+  }
+
   buildSessionKeyboard() {
     if (!Array.isArray(this.resumeListCache.sessionIds) || this.resumeListCache.sessionIds.length === 0) {
       return null;
@@ -652,15 +1161,134 @@ class Bridge {
     return this.mergeReplyMarkup({ inline_keyboard }, this.buildControlKeyboard());
   }
 
-  async handleCallbackAction(data, callbackQueryId, messageId = null) {
+  async handleCallbackAction(data, callbackQueryId, messageId = null, messageThreadId = null) {
     const action = String(data || '').trim();
     if (!action) {
       return;
     }
 
+    const replyMarkup = this.getReplyMarkupForThread(messageThreadId);
+
     try {
+      if (action === 'hosts') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildHostListText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup,
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'main:newproject') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildNewProjectHelpText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup,
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'forum:add_project' || action === 'forum:switch_project') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        const hostTopic = this.findForumTopicByThreadId(messageThreadId);
+        const hostname =
+          this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.hostThreadId ? hostTopic?.hostname || os.hostname() : os.hostname();
+        await this.publishTelegramView(this.buildForumWorkspaceBrowserText({ hostname }), {
+          messageId,
+          messageThreadId,
+          replyMarkup: this.buildForumWorkspaceKeyboard({ hostname, messageThreadId }),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'forum:topic_info') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildCurrentProjectTopicText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup,
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'forum:open_host') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildCurrentHostTopicText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup,
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'forum:open_main') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildMainTopicText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup: this.buildMainKeyboard(),
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'main:current_host') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildCurrentHostTopicText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup,
+          persistMenu: true,
+        });
+        return;
+      }
+
+      if (action === 'main:current_project') {
+        await this.telegram.answerCallbackQuery(callbackQueryId);
+        await this.publishTelegramView(this.buildCurrentProjectTopicText(), {
+          messageId,
+          messageThreadId,
+          replyMarkup,
+          persistMenu: true,
+        });
+        return;
+      }
+
       if (action === 'projects') {
         await this.telegram.answerCallbackQuery(callbackQueryId);
+        if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.mainThreadId) {
+          await this.publishTelegramView(this.buildForumProjectListText(), {
+            messageId,
+            messageThreadId,
+            replyMarkup,
+            persistMenu: true,
+          });
+          return;
+        }
+
+        if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.hostThreadId) {
+          const hostTopic = this.findForumTopicByThreadId(messageThreadId);
+          await this.publishTelegramView(
+            this.buildForumProjectListText({
+              hostname: hostTopic?.hostname || os.hostname(),
+            }),
+            {
+              messageId,
+              messageThreadId,
+              replyMarkup,
+              persistMenu: true,
+            }
+          );
+          return;
+        }
+
         await this.sendProjectList('telegram', { messageId, persistMenu: true });
         return;
       }
@@ -673,6 +1301,26 @@ class Bridge {
 
       if (action === 'menu') {
         await this.telegram.answerCallbackQuery(callbackQueryId);
+        if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.mainThreadId) {
+          await this.publishTelegramView(this.buildMainTopicText(), {
+            messageId,
+            messageThreadId,
+            replyMarkup,
+            persistMenu: true,
+          });
+          return;
+        }
+
+        if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.hostThreadId) {
+          await this.publishTelegramView(this.buildHostTopicText(this.findForumTopicByThreadId(messageThreadId)), {
+            messageId,
+            messageThreadId,
+            replyMarkup,
+            persistMenu: true,
+          });
+          return;
+        }
+
         await this.openControlPanel({ messageId });
         return;
       }
@@ -699,6 +1347,26 @@ class Bridge {
 
       if (action === 'status') {
         await this.telegram.answerCallbackQuery(callbackQueryId);
+        if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.mainThreadId) {
+          await this.publishTelegramView(this.buildMainTopicText(), {
+            messageId,
+            messageThreadId,
+            replyMarkup,
+            persistMenu: true,
+          });
+          return;
+        }
+
+        if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.hostThreadId) {
+          await this.publishTelegramView(this.buildHostTopicText(this.findForumTopicByThreadId(messageThreadId)), {
+            messageId,
+            messageThreadId,
+            replyMarkup,
+            persistMenu: true,
+          });
+          return;
+        }
+
         await this.publishTelegramView(
           buildStatusText(
             this.config,
@@ -709,7 +1377,8 @@ class Bridge {
           ),
           {
             messageId,
-            replyMarkup: this.buildControlKeyboard(),
+            messageThreadId,
+            replyMarkup,
             persistMenu: true,
           }
         );
@@ -723,7 +1392,8 @@ class Bridge {
         });
         await this.publishTelegramView(usageText, {
           messageId,
-          replyMarkup: this.buildControlKeyboard(),
+          messageThreadId,
+          replyMarkup,
           persistMenu: true,
         });
         return;
@@ -734,7 +1404,8 @@ class Bridge {
         this.setSessionMode('latest');
         await this.publishTelegramView(this.buildSessionStatusText(), {
           messageId,
-          replyMarkup: this.buildControlKeyboard(),
+          messageThreadId,
+          replyMarkup,
           persistMenu: true,
         });
         return;
@@ -745,7 +1416,8 @@ class Bridge {
         this.setSessionMode('new');
         await this.publishTelegramView(this.buildSessionStatusText(), {
           messageId,
-          replyMarkup: this.buildControlKeyboard(),
+          messageThreadId,
+          replyMarkup,
           persistMenu: true,
         });
         return;
@@ -762,6 +1434,20 @@ class Bridge {
         const value = action.slice('resume:'.length).trim();
         await this.telegram.answerCallbackQuery(callbackQueryId, 'Switching session...');
         await this.handleResumeCommand(value, 'telegram', { messageId, persistMenu: true });
+        return;
+      }
+
+      if (action.startsWith('forum:switch_project:')) {
+        const value = action.slice('forum:switch_project:'.length).trim();
+        await this.telegram.answerCallbackQuery(callbackQueryId, 'Switching project...');
+        await this.handleProjectSwitchCommand(value, 'telegram', { messageId, messageThreadId, persistMenu: true });
+        return;
+      }
+
+      if (action.startsWith('forum:create_topic:')) {
+        const value = action.slice('forum:create_topic:'.length).trim();
+        await this.telegram.answerCallbackQuery(callbackQueryId, 'Creating topic...');
+        await this.handleForumCreateTopic(value, 'telegram', { messageId, messageThreadId, persistMenu: true });
         return;
       }
 
@@ -827,6 +1513,9 @@ class Bridge {
 
     this.persistWorkspaceState();
     this.restoreWorkspaceState(targetPath);
+    if (this.telegramForumState?.enabled && this.config.telegramChatId) {
+      await this.ensureTelegramProjectTopic(this.config.telegramChatId, targetPath, os.hostname());
+    }
     this.resumeListCache = {
       provider: this.provider,
       sessionIds: [],
@@ -834,10 +1523,13 @@ class Bridge {
 
     const message = [
       `Switched project to ${targetPath}.`,
+      this.telegramForumState?.enabled && Number.isInteger(this.telegramThreadId) ? `Topic thread: ${this.telegramThreadId}` : null,
       `Provider: ${this.provider}`,
       `Session mode: ${this.sessionMode}`,
       `Session: ${this.getBoundSessionId() || '(latest in current folder)'}`,
-    ].join('\n');
+    ]
+      .filter(Boolean)
+      .join('\n');
 
     this.logCliEvent(`${sourceLabel} project switch`, targetPath);
 
@@ -849,7 +1541,57 @@ class Bridge {
 
     await this.publishTelegramView(message, {
       messageId: options.messageId,
-      replyMarkup: this.buildControlKeyboard(),
+      messageThreadId: this.getActiveTelegramThreadId(),
+      replyMarkup: this.getReplyMarkupForThread(this.getActiveTelegramThreadId()),
+      persistMenu: options.persistMenu === true,
+    });
+  }
+
+  async handleForumCreateTopic(rawArgument = '', source = 'telegram', options = {}) {
+    const argument = String(rawArgument || '').trim();
+    if (!argument) {
+      await this.safeSendMessage('Project list entry not found. Open Add Project first.');
+      return;
+    }
+
+    let targetPath = '';
+    if (/^\d+$/.test(argument)) {
+      const selected = this.projectListCache[Number(argument) - 1];
+      if (!selected) {
+        await this.safeSendMessage('Project list entry not found. Open Add Project first.');
+        return;
+      }
+      targetPath = selected.path;
+    } else {
+      targetPath = path.resolve(this.getCurrentWorkspacePath(), argument);
+    }
+
+    if (!this.telegramForumState?.enabled || !this.config.telegramChatId) {
+      await this.safeSendMessage('Forum mode is not active in this chat.');
+      return;
+    }
+
+    const existing = this.getForumProjectTopicRecord(targetPath, os.hostname());
+    const topic = existing || (await this.ensureTelegramProjectTopic(this.config.telegramChatId, targetPath, os.hostname()));
+    const message = [
+      `Project topic ready: ${topic?.title || formatWorkspaceLabel(targetPath)}`,
+      `Workspace: ${targetPath}`,
+      `Thread: ${topic?.threadId || '-'}`,
+      existing ? 'Topic already existed.' : 'Topic was created.',
+    ].join('\n');
+
+    if (source === 'cli') {
+      this.writeCliLine(message);
+      return;
+    }
+
+    await this.publishTelegramView(message, {
+      messageId: options.messageId,
+      messageThreadId: options.messageThreadId,
+      replyMarkup: this.buildForumWorkspaceKeyboard({
+        hostname: os.hostname(),
+        messageThreadId: options.messageThreadId,
+      }),
       persistMenu: options.persistMenu === true,
     });
   }
@@ -976,7 +1718,7 @@ class Bridge {
     });
 
     this.localInputInterface = rl;
-    this.writeCliLine('Local CLI input enabled. Type /help for local commands, or type a prompt directly.');
+    this.writeCliLine('Local CLI input enabled. Type /help for local commands.');
     rl.setPrompt('ushagent> ');
     rl.prompt();
 
@@ -1039,14 +1781,14 @@ class Bridge {
           '/status - show current status',
           '/session - show current session binding and next prompt mode',
           '/new - reset session (next prompt starts fresh)',
+          '/reset - remove local UshAgent config and stop the bridge',
+          '/addclient - generate a join-client command for another forum-mode computer',
+          '/add - alias for /addclient',
           '/resume [session-id|last|list|N] - resume saved, explicit, latest, listed session, or show sessions',
           '/r [session-id|last|list|N] - alias for /resume',
           '/stop - stop current execution and clear queued Telegram messages',
           '/say <text> - send a raw message to Telegram',
-          '/ask <prompt> - run prompt through provider and send response to Telegram',
           '/exit - stop UshAgent',
-          '',
-          'Any plain text line is treated as /ask <line>.',
         ].join('\n')
       );
       return;
@@ -1120,6 +1862,27 @@ class Bridge {
       return;
     }
 
+    if (line === '/reset') {
+      await this.safeSendMessage('Local UshAgent config reset from CLI. Restart setup on next launch.', { from: 'CLI' });
+      if (typeof this.config.resetAll === 'function') {
+        this.config.resetAll();
+      } else {
+        this.config.clearPairing({ keepBotToken: false });
+        this.config.set('provider', null);
+      }
+      this.running = false;
+      this.stopLocalInputLoop();
+      this.writeCliLine('Local config reset. Stopping UshAgent...');
+      return;
+    }
+
+    if (line === '/addclient' || line === '/add') {
+      const bundle = createClientBootstrapBundle(this.config);
+      this.writeCliLine('Run this on the other computer:');
+      this.writeCliLine(`ushagent join-client --bundle "${bundle}" --yes`);
+      return;
+    }
+
     if (line === '/resume' || line.startsWith('/resume ') || line === '/r' || line.startsWith('/r ')) {
       const commandLength = line.startsWith('/r') && !line.startsWith('/resume') ? '/r'.length : '/resume'.length;
       const argument = line.slice(commandLength).trim();
@@ -1162,32 +1925,12 @@ class Bridge {
       return;
     }
 
-    if (line.startsWith('/ask ')) {
-      const prompt = line.slice(5).trim();
-      if (!prompt) {
-        this.writeCliLine('Usage: /ask <prompt>');
-        return;
-      }
-      this.recordConversationEntry({
-        source: 'cli',
-        direction: 'in',
-        text: prompt,
-      });
-      await this.queuePrompt(prompt, 'cli');
-      return;
-    }
-
     if (line.startsWith('/')) {
       this.writeCliLine('Unknown local command. Use /help.');
       return;
     }
 
-    this.recordConversationEntry({
-      source: 'cli',
-      direction: 'in',
-      text: line,
-    });
-    await this.queuePrompt(line, 'cli');
+    this.writeCliLine('Local CLI accepts commands only. Use Telegram to send prompts to Codex.');
   }
 
   async ensureBridgeReady() {
@@ -1217,6 +1960,7 @@ class Bridge {
 
     const needToken = !tokenConnected;
     const needPairing = !this.config.telegramChatId;
+    const chatMode = needPairing ? await this.selectTelegramChatMode() : TELEGRAM_CHAT_MODE_PRIVATE;
 
     if (!needToken && !needPairing) {
       return {
@@ -1226,10 +1970,10 @@ class Bridge {
 
     const setupMode = await this.selectSetupMode();
     if (setupMode === SETUP_MODE_PHONE) {
-      return this.runPhoneOnboardingSetup({ needToken, needPairing });
+      return this.runPhoneOnboardingSetup({ needToken, needPairing, chatMode });
     }
 
-    return this.runManualSetup({ needToken, needPairing });
+    return this.runManualSetup({ needToken, needPairing, chatMode });
   }
 
   async selectSetupMode() {
@@ -1255,9 +1999,33 @@ class Bridge {
     return SETUP_MODE_MANUAL;
   }
 
+  async selectTelegramChatMode() {
+    if (process.stdin.isTTY && process.stdout.isTTY) {
+      return select({
+        message: 'Telegram chat mode',
+        default: TELEGRAM_CHAT_MODE_PRIVATE,
+        choices: [
+          {
+            name: 'Private chat — one bot, one direct message thread',
+            value: TELEGRAM_CHAT_MODE_PRIVATE,
+          },
+          {
+            name: 'Forum topics — use a Telegram supergroup with Topics enabled',
+            value: TELEGRAM_CHAT_MODE_FORUM,
+          },
+        ],
+      });
+    }
+
+    console.log('Interactive chat mode selection is unavailable in this terminal.');
+    console.log('Using private chat mode by default.');
+    return TELEGRAM_CHAT_MODE_PRIVATE;
+  }
+
   async runPhoneOnboardingSetup(options = {}) {
     const needToken = Boolean(options.needToken);
     const needPairing = Boolean(options.needPairing);
+    const chatMode = options.chatMode || TELEGRAM_CHAT_MODE_PRIVATE;
     let onboarding = null;
 
     try {
@@ -1303,6 +2071,7 @@ class Bridge {
       if (needPairing) {
         pairing = await this.runPairingFlow({
           mode: 'onboarding',
+          chatMode,
           onPairLink: deepLink => onboarding.setPairLink(deepLink),
           onStatus: text => onboarding.setPairingStatus(text),
         });
@@ -1328,6 +2097,7 @@ class Bridge {
   async runManualSetup(options = {}) {
     const needToken = Boolean(options.needToken);
     const needPairing = Boolean(options.needPairing);
+    const chatMode = options.chatMode || TELEGRAM_CHAT_MODE_PRIVATE;
 
     if (needToken) {
       while (this.running) {
@@ -1354,7 +2124,7 @@ class Bridge {
     }
 
     if (needPairing) {
-      return this.runPairingFlow({ mode: 'manual' });
+      return this.runPairingFlow({ mode: 'manual', chatMode });
     }
 
     return {
@@ -1522,6 +2292,9 @@ class Bridge {
       const resume = !this.forceNewNextPrompt;
       const abortController = new globalThis.AbortController();
       const groupedCount = Number.isFinite(options.groupedCount) ? Math.max(1, Number(options.groupedCount)) : 1;
+      let lastProgressText = '';
+      let progressChain = Promise.resolve();
+      let progressMessageId = null;
       this.logCliEvent(`${sourceLabel} -> ${providerLabel}`, cleanPrompt);
       this.activePromptAbortController = abortController;
       this.activePromptSource = source;
@@ -1529,15 +2302,52 @@ class Bridge {
 
       try {
         if (source === 'telegram') {
+          let progressMessageText = '';
           if (groupedCount > 1) {
-            await this.safeSendMessage(`${providerLabel} is working on ${groupedCount} messages...`);
+            progressMessageText = `${providerLabel} is working on ${groupedCount} messages...`;
           } else {
-            await this.safeSendMessage(`${providerLabel} is working...`);
+            progressMessageText = `${providerLabel} is working...`;
+          }
+
+          const progressMessage = await this.safeSendMessage(progressMessageText);
+          if (Number.isInteger(progressMessage?.message_id)) {
+            progressMessageId = progressMessage.message_id;
           }
         }
 
         const response = await this.runProvider(cleanPrompt, resume, {
           abortSignal: abortController.signal,
+          onProgress: progressMessage => {
+            const normalized = String(progressMessage || '').trim();
+            if (!normalized || normalized === lastProgressText) {
+              return;
+            }
+
+            lastProgressText = normalized;
+            this.logCliEvent(`${providerLabel} progress`, normalized);
+
+            if (source !== 'telegram') {
+              return;
+            }
+
+            const nextProgressText = `${providerLabel} is working...\n\n${normalized}`;
+            progressChain = progressChain
+              .then(async () => {
+                if (!Number.isInteger(progressMessageId)) {
+                  return;
+                }
+
+                await this.telegram.editMessageText(this.config.telegramChatId, progressMessageId, nextProgressText, {
+                  messageThreadId: this.getActiveTelegramThreadId(),
+                });
+              })
+              .catch(() => null);
+          },
+          onRawEvent: DEBUG_CODEX_STREAM
+            ? line => {
+                this.logCliEvent(`${providerLabel} stream`, summarizeCodexEventLine(line));
+              }
+            : null,
         });
 
         if (this.sessionMode === 'new') {
@@ -1577,6 +2387,7 @@ class Bridge {
 
   async runPairingFlow(options = {}) {
     const mode = options.mode || 'manual';
+    const chatMode = options.chatMode || TELEGRAM_CHAT_MODE_PRIVATE;
     const onPairLink = typeof options.onPairLink === 'function' ? options.onPairLink : null;
     const onStatus = typeof options.onStatus === 'function' ? options.onStatus : null;
 
@@ -1588,23 +2399,51 @@ class Bridge {
     const code = makePairCode();
     const deepLink = `https://t.me/${botUsername}?start=ha2_${code}`;
 
-    if (mode === 'manual') {
-      console.log('\nTelegram pairing is required (manual fallback).');
-      console.log('1. Scan this QR code or open the link');
-      console.log('2. Press START in Telegram');
-      console.log('3. Keep this terminal open until pairing completes\n');
-      qrcode.generate(deepLink, { small: true });
-      console.log(`Link: ${deepLink}`);
-      console.log('If needed, open your bot manually and press START.\n');
-      console.log('Waiting for Telegram pairing...');
+    if (chatMode === TELEGRAM_CHAT_MODE_FORUM) {
+      const forumInstructions = [
+        'Telegram forum pairing is required.',
+        '1. Create or open a Telegram supergroup.',
+        '2. Enable Topics in that chat.',
+        '3. Add your bot to the supergroup.',
+        `4. In the group, send /start@${botUsername} or /help@${botUsername}.`,
+        '5. Keep this terminal open until pairing completes.',
+      ];
+
+      if (mode === 'manual') {
+        console.log('');
+        for (const line of forumInstructions) {
+          console.log(line);
+        }
+        console.log('');
+        console.log('Waiting for Telegram forum pairing...');
+      } else {
+        if (onPairLink) {
+          onPairLink(`https://t.me/${botUsername}`);
+        }
+        if (onStatus) {
+          onStatus(`Open your forum chat, add @${botUsername}, then send /start@${botUsername} or /help@${botUsername}.`);
+        }
+        console.log('\nWaiting for Telegram forum pairing from phone onboarding...');
+      }
     } else {
-      if (onPairLink) {
-        onPairLink(deepLink);
+      if (mode === 'manual') {
+        console.log('\nTelegram pairing is required (manual fallback).');
+        console.log('1. Scan this QR code or open the link');
+        console.log('2. Press START in Telegram');
+        console.log('3. Keep this terminal open until pairing completes\n');
+        qrcode.generate(deepLink, { small: true });
+        console.log(`Link: ${deepLink}`);
+        console.log('If needed, open your bot manually and press START.\n');
+        console.log('Waiting for Telegram pairing...');
+      } else {
+        if (onPairLink) {
+          onPairLink(deepLink);
+        }
+        if (onStatus) {
+          onStatus('Open bot chat and press START. Waiting for Telegram pairing...');
+        }
+        console.log('\nWaiting for Telegram pairing from phone onboarding...');
       }
-      if (onStatus) {
-        onStatus('Open bot chat and press START. Waiting for Telegram pairing...');
-      }
-      console.log('\nWaiting for Telegram pairing from phone onboarding...');
     }
 
     let cursor = this.config.telegramUpdateCursor || 0;
@@ -1619,28 +2458,62 @@ class Bridge {
         }
 
         for (const message of result.messages) {
-          if (message.chatType !== 'private') {
-            continue;
-          }
-
-          if (!isPairStartMessage(message.text, code)) {
-            continue;
-          }
-
           if (!message.chatId) {
+            continue;
+          }
+
+          if (chatMode === TELEGRAM_CHAT_MODE_PRIVATE) {
+            if (message.chatType !== 'private') {
+              continue;
+            }
+
+            if (!isPairStartMessage(message.text, code)) {
+              continue;
+            }
+
+            this.config.setMany({
+              telegramChatId: message.chatId,
+              telegramChatUserId: message.userId || null,
+            });
+
+            if (onStatus) {
+              onStatus(`Paired successfully (chat ${message.chatId}).`);
+            }
+
+            await this.telegram.sendMessage(message.chatId, `UshAgent paired for ${this.provider}.\nSend /help for commands.`);
+
+            return {
+              chatId: message.chatId,
+            };
+          }
+
+          if (message.chatType !== 'supergroup') {
+            continue;
+          }
+
+          const normalizedText = String(message.text || '').trim();
+          if (!normalizedText.startsWith('/')) {
+            continue;
+          }
+
+          const forumChat = await this.telegram.getChat(message.chatId);
+          if (forumChat?.is_forum !== true) {
             continue;
           }
 
           this.config.setMany({
             telegramChatId: message.chatId,
-            telegramChatUserId: message.userId || null,
+            telegramChatUserId: null,
           });
 
           if (onStatus) {
-            onStatus(`Paired successfully (chat ${message.chatId}).`);
+            onStatus(`Forum paired successfully (chat ${message.chatId}).`);
           }
 
-          await this.telegram.sendMessage(message.chatId, `UshAgent paired for ${this.provider}.\nSend /help for commands.`);
+          await this.telegram.sendMessage(
+            message.chatId,
+            `UshAgent paired for ${this.provider} in forum mode.\nUse HOST and PROJECT topics to manage work.`
+          );
 
           return {
             chatId: message.chatId,
@@ -1667,6 +2540,8 @@ class Bridge {
     const chatId = this.config.telegramChatId;
     const chatUserId = this.config.telegramChatUserId;
     const cursor = this.config.telegramUpdateCursor || 0;
+    const mainThreadId = this.telegramForumState?.mainThreadId ?? null;
+    const hostThreadId = this.telegramForumState?.hostThreadId ?? null;
 
     if (!chatId) {
       throw new Error('No Telegram chat is paired. Run `ushagent reset` then start again.');
@@ -1692,13 +2567,46 @@ class Bridge {
           continue;
         }
 
-        if (message.text && message.text.trim().startsWith('/')) {
-          this.logCliEvent('Telegram command', message.text);
-        }
+        const threadTopic =
+          this.telegramForumState?.enabled && Number.isInteger(message.messageThreadId)
+            ? this.findForumTopicByThreadId(message.messageThreadId)
+            : null;
 
         if (message.type === 'callback') {
-          await this.handleCallbackAction(message.data || message.text || '', message.callbackQueryId, message.messageId || null);
+          if (threadTopic?.kind === 'project') {
+            this.syncForumWorkspaceForThread(message.messageThreadId);
+          }
+          await this.handleCallbackAction(
+            message.data || message.text || '',
+            message.callbackQueryId,
+            message.messageId || null,
+            message.messageThreadId || null
+          );
           continue;
+        }
+
+        if (this.telegramForumState?.enabled) {
+          if (!threadTopic && message.messageThreadId !== mainThreadId && message.messageThreadId !== hostThreadId) {
+            continue;
+          }
+
+          if (message.messageThreadId === mainThreadId) {
+            await this.handleMainTopicMessage(message);
+            continue;
+          }
+
+          if (message.messageThreadId === hostThreadId) {
+            await this.handleHostTopicMessage(message);
+            continue;
+          }
+
+          if (threadTopic?.kind === 'project') {
+            this.syncForumWorkspaceForThread(message.messageThreadId);
+          }
+        }
+
+        if (message.text && message.text.trim().startsWith('/')) {
+          this.logCliEvent('Telegram command', message.text);
         }
 
         if (message.fileId) {
@@ -1738,6 +2646,83 @@ class Bridge {
     }
 
     await this.enqueueTelegramPrompt(text);
+  }
+
+  async handleMainTopicMessage(message) {
+    const text = String(message?.text || '').trim();
+    if (!text) {
+      return;
+    }
+
+    const command = normalizeTelegramCommand(text.split(/\s+/)[0] || '');
+    if (command === '/usage') {
+      await this.publishTelegramView(await this.buildUsageText({ force: true }), {
+        messageThreadId: this.telegramForumState?.mainThreadId ?? null,
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (command === '/projects') {
+      await this.publishTelegramView(this.buildForumProjectListText(), {
+        messageThreadId: this.telegramForumState?.mainThreadId ?? null,
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (command === '/hosts') {
+      await this.publishTelegramView(this.buildHostListText(), {
+        messageThreadId: this.telegramForumState?.mainThreadId ?? null,
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (command === '/status' || command === '/menu' || command === '/help') {
+      await this.publishTelegramView(this.buildMainTopicText(), {
+        messageThreadId: this.telegramForumState?.mainThreadId ?? null,
+        replyMarkup: this.buildControlKeyboard(),
+      });
+    }
+  }
+
+  async handleHostTopicMessage(message) {
+    const text = String(message?.text || '').trim();
+    if (!text) {
+      return;
+    }
+
+    const command = normalizeTelegramCommand(text.split(/\s+/)[0] || '');
+    const hostTopic = this.findForumTopicByThreadId(message.messageThreadId);
+
+    if (command === '/usage') {
+      await this.publishTelegramView(await this.buildUsageText({ force: true }), {
+        messageThreadId: message.messageThreadId,
+        replyMarkup: this.buildControlKeyboard(),
+      });
+      return;
+    }
+
+    if (command === '/projects') {
+      await this.publishTelegramView(
+        this.buildForumProjectListText({
+          hostname: hostTopic?.hostname || os.hostname(),
+        }),
+        {
+          messageThreadId: message.messageThreadId,
+          replyMarkup: this.buildControlKeyboard(),
+        }
+      );
+      return;
+    }
+
+    if (command === '/status' || command === '/menu' || command === '/help') {
+      await this.publishTelegramView(this.buildHostTopicText(hostTopic), {
+        messageThreadId: message.messageThreadId,
+        replyMarkup: this.buildControlKeyboard(),
+      });
+    }
   }
 
   async handleAttachmentMessage(message) {
@@ -1939,6 +2924,7 @@ class Bridge {
 
     try {
       return await this.telegram.sendMessage(chatId, text, {
+        messageThreadId: Number.isInteger(options.messageThreadId) ? options.messageThreadId : this.getActiveTelegramThreadId(),
         replyMarkup,
       });
     } catch (error) {

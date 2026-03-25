@@ -8,6 +8,7 @@ import Config from '../src/config.js';
 import Logger from '../src/logger.js';
 import { applyDefaultBypassArgs, sanitizeProviderArgs } from '../src/args.js';
 import { loadUshAgentEnv } from '../src/env.js';
+import { applyClientBootstrapBundle, createClientBootstrapBundle } from '../src/client-bootstrap.js';
 import {
   getServiceDefinition,
   getUserServiceStatus,
@@ -30,6 +31,9 @@ Usage:
   ushagent status
   ushagent service <install|status|start|stop|restart|remove>
   ushagent reset              Reset Telegram setup (bot token + chat pairing)
+  ushagent reset-config       Remove the entire local UshAgent config
+  ushagent addclient          Generate a forum-mode bootstrap command for another computer
+  ushagent join-client --bundle <bundle>
   ushagent --version          Show version number
 
 Examples:
@@ -361,9 +365,116 @@ async function main() {
     return;
   }
 
+  if (command === 'reset-config') {
+    const config = new Config();
+    const force = args.includes('--yes') || args.includes('-y');
+
+    let accepted = force;
+    if (!accepted) {
+      if (process.stdin.isTTY && process.stdout.isTTY) {
+        accepted = await confirm({
+          message: `Remove the entire local UshAgent config at ${config.configPath}?`,
+          default: false,
+        });
+      } else {
+        console.log('Config reset needs confirmation. Re-run with --yes in non-interactive mode.');
+        return;
+      }
+    }
+
+    if (!accepted) {
+      console.log('Config reset cancelled.');
+      return;
+    }
+
+    config.resetAll();
+    console.log('Local UshAgent config removed.');
+    return;
+  }
+
+  if (command === 'addclient') {
+    const config = new Config();
+    const bundle = createClientBootstrapBundle(config);
+    const quotedBundle = process.platform === 'win32' ? `"${bundle}"` : `'${bundle}'`;
+
+    console.log('Run this on the other computer:');
+    console.log('');
+    console.log(`ushagent join-client --bundle ${quotedBundle}`);
+    console.log('');
+    console.log('This bootstrap currently supports only forum-mode chats.');
+    return;
+  }
+
+  if (command === 'join-client') {
+    const config = new Config();
+    const bundleFlagIndex = args.findIndex(value => value === '--bundle');
+    const bundle =
+      bundleFlagIndex >= 0
+        ? String(args[bundleFlagIndex + 1] || '').trim()
+        : (() => {
+            const inline = args.find(value => String(value || '').startsWith('--bundle='));
+            return inline ? String(inline).slice('--bundle='.length).trim() : '';
+          })();
+
+    if (!bundle) {
+      throw new Error('Missing required --bundle value.');
+    }
+
+    const force = args.includes('--yes') || args.includes('-y');
+    let accepted = force;
+    if (!accepted) {
+      if (process.stdin.isTTY && process.stdout.isTTY) {
+        accepted = await confirm({
+          message: `Apply client bootstrap into ${config.configPath}?`,
+          default: true,
+        });
+      } else {
+        console.log('join-client needs confirmation. Re-run with --yes in non-interactive mode.');
+        return;
+      }
+    }
+
+    if (!accepted) {
+      console.log('join-client cancelled.');
+      return;
+    }
+
+    const parsed = applyClientBootstrapBundle(config, bundle);
+    console.log(`Client bootstrap applied for chat ${parsed.chatId}.`);
+    console.log(`Provider: ${parsed.provider}`);
+    console.log(`Bot: ${parsed.botUsername ? `@${parsed.botUsername}` : 'configured'}`);
+    console.log('Next step: run `ushagent codex` on this computer.');
+    return;
+  }
+
   if (command === 'reset' || command === 'unpair') {
     const config = new Config();
     const force = args.includes('--yes') || args.includes('-y');
+    const resetAll = args.includes('--all');
+
+    if (resetAll) {
+      let accepted = force;
+      if (!accepted) {
+        if (process.stdin.isTTY && process.stdout.isTTY) {
+          accepted = await confirm({
+            message: `Remove the entire local UshAgent config at ${config.configPath}?`,
+            default: false,
+          });
+        } else {
+          console.log('Config reset needs confirmation. Re-run with --yes in non-interactive mode.');
+          return;
+        }
+      }
+
+      if (!accepted) {
+        console.log('Config reset cancelled.');
+        return;
+      }
+
+      config.resetAll();
+      console.log('Local UshAgent config removed.');
+      return;
+    }
 
     const details = [
       `bot: ${config.telegramBotUsername ? `@${config.telegramBotUsername}` : 'not set'}`,
