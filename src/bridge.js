@@ -20,6 +20,7 @@ import { fetchCodexUsage, formatCodexUsage } from './providers/codex-usage.js';
 import {
   createProviderRuntime,
   formatProviderName,
+  getProviderDefinition,
   getProviderSessionId,
   setProviderSessionId,
 } from './providers/provider-registry.js';
@@ -212,10 +213,7 @@ class Bridge {
     this.manualHelpShown = false;
     this.localInputInterface = null;
     this.localInputQueue = Promise.resolve();
-    this.promptQueue = Promise.resolve();
-    this.activePromptAbortController = null;
-    this.activePromptSource = null;
-    this.activePromptAbortReason = null;
+    this.executionStates = new Map();
     this.telegramPendingMessages = [];
     this.telegramDispatchScheduled = false;
     this.resumeListCache = {
@@ -235,7 +233,7 @@ class Bridge {
         return;
       }
       this.isStopping = true;
-      this.requestStopCurrentPrompt('shutdown');
+      this.requestStopCurrentPrompt('shutdown', { all: true });
       this.clearQueuedTelegramMessages();
       this.running = false;
       this.stopLocalInputLoop();
@@ -574,16 +572,60 @@ class Bridge {
       return;
     }
 
-    this.config.setWorkspace(normalizedPath, {
-      label: path.basename(normalizedPath) || normalizedPath,
-      lastUsedAt: new Date().toISOString(),
+    this.persistWorkspaceRecord(normalizedPath, {
       provider: this.provider,
-      codexArgs: this.config.codexArgs,
-      codexLastSessionId: this.config.codexLastSessionId,
+      providerArgs: this.config.codexArgs,
+      lastSessionId: this.config.codexLastSessionId,
       sessionMode: this.sessionMode,
       pinnedSessionId: this.sessionMode === 'pinned' ? this.getLastSessionId() : null,
     });
     this.config.setActiveWorkspace(normalizedPath);
+  }
+
+  persistWorkspaceRecord(workspacePath, context = {}) {
+    const normalizedPath = String(workspacePath || '').trim();
+    if (!normalizedPath) {
+      return;
+    }
+
+    this.config.setWorkspace(normalizedPath, {
+      label: path.basename(normalizedPath) || normalizedPath,
+      lastUsedAt: new Date().toISOString(),
+      provider: String(context.provider || this.provider).trim() || this.provider,
+      codexArgs: Array.isArray(context.providerArgs) ? context.providerArgs : this.config.codexArgs,
+      codexLastSessionId:
+        context.lastSessionId === undefined
+          ? this.getWorkspaceProviderSessionId(normalizedPath, context.provider || this.provider)
+          : context.lastSessionId,
+      sessionMode: String(context.sessionMode || this.sessionMode).trim() || 'latest',
+      pinnedSessionId:
+        (String(context.sessionMode || this.sessionMode).trim() || 'latest') === 'pinned'
+          ? String(context.pinnedSessionId || '').trim() || null
+          : null,
+    });
+  }
+
+  getWorkspaceProviderSessionId(workspacePath, provider = this.provider) {
+    const normalizedPath = String(workspacePath || '').trim();
+    if (!normalizedPath) {
+      return null;
+    }
+
+    const record = this.config.getWorkspace(normalizedPath);
+    const definition = getProviderDefinition(provider);
+    return String(record?.[definition.sessionKey] || '').trim() || null;
+  }
+
+  setWorkspaceProviderSessionId(workspacePath, provider, sessionId) {
+    const normalizedPath = String(workspacePath || '').trim();
+    if (!normalizedPath) {
+      return;
+    }
+
+    const definition = getProviderDefinition(provider);
+    this.config.setWorkspace(normalizedPath, {
+      [definition.sessionKey]: String(sessionId || '').trim() || null,
+    });
   }
 
   restoreWorkspaceState(workspacePath) {
@@ -1483,7 +1525,8 @@ class Bridge {
       return;
     }
 
-    if (this.activePromptAbortController) {
+    const currentExecutionKey = this.getCurrentExecutionKey();
+    if (this.isExecutionBusy(currentExecutionKey)) {
       if (!force) {
         await this.safeSendMessage('A request is currently running. Use /stop first or /project <target> force.', {
           replyMarkup: this.buildControlKeyboard(),
@@ -1491,8 +1534,8 @@ class Bridge {
         return;
       }
 
-      this.requestStopCurrentPrompt('project_switch');
-      this.clearQueuedTelegramMessages();
+      this.requestStopCurrentPrompt('project_switch', { executionKey: currentExecutionKey });
+      this.clearQueuedTelegramMessages({ executionKey: currentExecutionKey });
     }
 
     let targetPath = '';
@@ -1892,7 +1935,7 @@ class Bridge {
     }
 
     if (line === '/stop') {
-      const stopped = this.requestStopCurrentPrompt('manual_stop');
+      const stopped = this.requestStopCurrentPrompt('manual_stop', { all: true });
       const clearedCount = this.clearQueuedTelegramMessages();
 
       if (stopped) {
@@ -2206,21 +2249,184 @@ class Bridge {
     ].join('\n');
   }
 
-  clearQueuedTelegramMessages() {
-    const count = this.telegramPendingMessages.length;
-    this.telegramPendingMessages = [];
-    return count;
+  getExecutionKeyForPrompt(source, options = {}) {
+    if (source === 'telegram' && Number.isInteger(options.messageThreadId)) {
+      return `telegram:${options.messageThreadId}`;
+    }
+
+    const workspacePath = String(options.workspacePath || '').trim();
+    if (workspacePath) {
+      return `${source}:${workspacePath.toLowerCase()}`;
+    }
+
+    return source === 'telegram' ? 'telegram:default' : 'default';
   }
 
-  requestStopCurrentPrompt(reason = 'manual_stop') {
-    const controller = this.activePromptAbortController;
+  getCurrentExecutionKey(source = 'telegram') {
+    return this.getExecutionKeyForPrompt(source, {
+      messageThreadId: this.getActiveTelegramThreadId(),
+      workspacePath: this.getCurrentWorkspacePath(),
+    });
+  }
+
+  getExecutionState(executionKey = 'default') {
+    const normalizedKey = String(executionKey || 'default').trim() || 'default';
+    if (!this.executionStates.has(normalizedKey)) {
+      this.executionStates.set(normalizedKey, {
+        promptQueue: Promise.resolve(),
+        activeAbortController: null,
+        activeSource: null,
+        activeAbortReason: null,
+        launchScheduled: false,
+      });
+    }
+
+    return this.executionStates.get(normalizedKey);
+  }
+
+  isExecutionBusy(executionKey = 'default') {
+    const state = this.getExecutionState(executionKey);
+    return state.launchScheduled || Boolean(state.activeAbortController);
+  }
+
+  getPendingExecutionKey(entry = {}) {
+    const explicit = String(entry?.executionKey || '').trim();
+    if (explicit) {
+      return explicit;
+    }
+
+    return this.getExecutionKeyForPrompt('telegram', {
+      messageThreadId: Number.isInteger(entry?.messageThreadId) ? entry.messageThreadId : null,
+      workspacePath: String(entry?.workspacePath || '').trim() || null,
+    });
+  }
+
+  clearQueuedTelegramMessages(options = {}) {
+    const targetExecutionKey = String(options.executionKey || '').trim() || null;
+    if (!targetExecutionKey) {
+      const count = this.telegramPendingMessages.length;
+      this.telegramPendingMessages = [];
+      return count;
+    }
+
+    const before = this.telegramPendingMessages.length;
+    this.telegramPendingMessages = this.telegramPendingMessages.filter(
+      entry => this.getPendingExecutionKey(entry) !== targetExecutionKey
+    );
+    const removed = before - this.telegramPendingMessages.length;
+    if (this.telegramPendingMessages.length > 0) {
+      this.startTelegramDispatch(true);
+    }
+    return removed;
+  }
+
+  requestStopCurrentPrompt(reason = 'manual_stop', options = {}) {
+    if (options.all === true) {
+      let stopped = false;
+      for (const state of this.executionStates.values()) {
+        if (state.activeAbortController && !state.activeAbortController.signal.aborted) {
+          state.activeAbortReason = reason;
+          state.activeAbortController.abort();
+          stopped = true;
+        }
+      }
+      return stopped;
+    }
+
+    const targetExecutionKey = String(options.executionKey || this.getCurrentExecutionKey()).trim() || 'default';
+    const state = this.getExecutionState(targetExecutionKey);
+    const controller = state.activeAbortController;
     if (!controller || controller.signal.aborted) {
       return false;
     }
 
-    this.activePromptAbortReason = reason;
+    state.activeAbortReason = reason;
     controller.abort();
     return true;
+  }
+
+  buildPromptExecutionContext(source, options = {}) {
+    const workspacePath = String(options.workspacePath || this.getCurrentWorkspacePath()).trim() || this.getCurrentWorkspacePath();
+    const record = this.config.getWorkspace(workspacePath);
+    const provider = String(record?.provider || this.provider).trim() || this.provider;
+    const providerArgs = Array.isArray(record?.codexArgs) ? [...record.codexArgs] : [...this.providerArgs];
+    const sessionMode =
+      record?.sessionMode === 'pinned' && record?.pinnedSessionId ? 'pinned' : record?.sessionMode === 'new' ? 'new' : 'latest';
+    const pinnedSessionId = String(record?.pinnedSessionId || '').trim() || null;
+    const lastSessionId = this.getWorkspaceProviderSessionId(workspacePath, provider);
+    const sourceThreadId =
+      source === 'telegram'
+        ? Number.isInteger(options.messageThreadId)
+          ? options.messageThreadId
+          : this.getActiveTelegramThreadId()
+        : null;
+    const executionKey = this.getExecutionKeyForPrompt(source, {
+      messageThreadId: sourceThreadId,
+      workspacePath,
+    });
+
+    return {
+      executionKey,
+      workspacePath,
+      provider,
+      providerArgs,
+      sessionMode,
+      pinnedSessionId,
+      lastSessionId,
+      sourceThreadId,
+    };
+  }
+
+  runProviderWithContext(prompt, context, options = {}) {
+    const abortSignal = options.abortSignal || null;
+    const runtime = createProviderRuntime(this.config, context.provider, context.providerArgs, {
+      getSessionId: () => context.lastSessionId,
+      setSessionId: sessionId => {
+        const normalized = String(sessionId || '').trim() || null;
+        context.lastSessionId = normalized;
+        this.setWorkspaceProviderSessionId(context.workspacePath, context.provider, normalized);
+        if (this.getCurrentWorkspacePath() === context.workspacePath) {
+          setProviderSessionId(this.config, context.provider, normalized);
+        }
+      },
+    });
+
+    return runtime.run(prompt, {
+      resume: context.sessionMode !== 'new',
+      cwd: context.workspacePath,
+      abortSignal,
+      sessionId: context.sessionMode === 'pinned' ? context.pinnedSessionId || '' : '',
+      onProgress: options.onProgress,
+      onRawEvent: options.onRawEvent,
+    });
+  }
+
+  finalizeExecutionContext(context) {
+    const nextSessionMode = context.sessionMode === 'new' ? 'latest' : context.sessionMode;
+    const nextPinnedSessionId = nextSessionMode === 'pinned' ? context.pinnedSessionId : null;
+
+    this.persistWorkspaceRecord(context.workspacePath, {
+      provider: context.provider,
+      providerArgs: context.providerArgs,
+      lastSessionId: context.lastSessionId,
+      sessionMode: nextSessionMode,
+      pinnedSessionId: nextPinnedSessionId,
+    });
+
+    if (this.getCurrentWorkspacePath() === context.workspacePath) {
+      this.provider = context.provider;
+      this.providerArgs = [...context.providerArgs];
+      this.sessionMode = nextSessionMode;
+      this.forceNewNextPrompt = nextSessionMode === 'new';
+      this.config.setMany({
+        provider: context.provider,
+        codexArgs: [...context.providerArgs],
+        codexLastSessionId: context.lastSessionId || null,
+      });
+      if (nextSessionMode === 'pinned' && nextPinnedSessionId) {
+        setProviderSessionId(this.config, context.provider, nextPinnedSessionId);
+      }
+    }
   }
 
   isPromptAbortError(error) {
@@ -2237,48 +2443,95 @@ class Bridge {
       return;
     }
 
-    if (this.activePromptAbortController) {
-      return;
-    }
-
     if (this.telegramPendingMessages.length === 0) {
       return;
     }
 
-    const pending = groupAll ? this.telegramPendingMessages.splice(0) : [this.telegramPendingMessages.shift()];
-    const combinedPrompt = pending.join('\n').trim();
-    if (!combinedPrompt) {
-      return;
-    }
-
     this.telegramDispatchScheduled = true;
-    this.queuePrompt(combinedPrompt, 'telegram', {
-      groupedCount: pending.length,
-    })
-      .catch(error => {
-        this.logger.error(`Failed to process grouped Telegram messages: ${error.message}`);
-      })
-      .finally(() => {
-        this.telegramDispatchScheduled = false;
-        if (this.telegramPendingMessages.length > 0) {
-          this.startTelegramDispatch(true);
+    try {
+      let launched = false;
+
+      for (let index = 0; index < this.telegramPendingMessages.length; index += 1) {
+        const firstPending = this.telegramPendingMessages[index];
+        if (!firstPending) {
+          continue;
         }
-      });
+
+        const executionKey = this.getPendingExecutionKey(firstPending);
+        if (this.isExecutionBusy(executionKey)) {
+          continue;
+        }
+
+        this.telegramPendingMessages.splice(index, 1);
+        const pending = [firstPending];
+
+        if (groupAll) {
+          for (let pendingIndex = index; pendingIndex < this.telegramPendingMessages.length; ) {
+            const nextPending = this.telegramPendingMessages[pendingIndex];
+            if (this.getPendingExecutionKey(nextPending) !== executionKey) {
+              pendingIndex += 1;
+              continue;
+            }
+
+            pending.push(nextPending);
+            this.telegramPendingMessages.splice(pendingIndex, 1);
+          }
+        }
+
+        const combinedPrompt = pending
+          .map(entry => String(entry?.text || '').trim())
+          .filter(Boolean)
+          .join('\n')
+          .trim();
+        if (!combinedPrompt) {
+          index -= 1;
+          continue;
+        }
+
+        launched = true;
+        this.queuePrompt(combinedPrompt, 'telegram', {
+          groupedCount: pending.length,
+          messageThreadId: Number.isInteger(firstPending?.messageThreadId) ? firstPending.messageThreadId : null,
+          workspacePath: String(firstPending?.workspacePath || '').trim() || null,
+          executionKey,
+        }).catch(error => {
+          this.logger.error(`Failed to process grouped Telegram messages: ${error.message}`);
+        });
+
+        index -= 1;
+      }
+
+      if (!launched && this.telegramPendingMessages.length > 0) {
+        return;
+      }
+    } finally {
+      this.telegramDispatchScheduled = false;
+    }
   }
 
-  async enqueueTelegramPrompt(text) {
+  async enqueueTelegramPrompt(text, options = {}) {
     const cleanText = String(text || '').trim();
     if (!cleanText) {
       return;
     }
 
-    this.telegramPendingMessages.push(cleanText);
+    const executionKey = this.getExecutionKeyForPrompt('telegram', {
+      messageThreadId: Number.isInteger(options.messageThreadId) ? options.messageThreadId : null,
+      workspacePath: String(options.workspacePath || '').trim() || null,
+    });
 
-    if (this.activePromptAbortController || this.telegramDispatchScheduled) {
+    this.telegramPendingMessages.push({
+      text: cleanText,
+      messageThreadId: Number.isInteger(options.messageThreadId) ? options.messageThreadId : null,
+      workspacePath: String(options.workspacePath || '').trim() || null,
+      executionKey,
+    });
+
+    if (this.telegramDispatchScheduled) {
       return;
     }
 
-    this.startTelegramDispatch(false);
+    this.startTelegramDispatch(true);
   }
 
   async queuePrompt(prompt, source, options = {}) {
@@ -2287,21 +2540,30 @@ class Bridge {
       return;
     }
 
+    const context = this.buildPromptExecutionContext(source, options);
+    const state = this.getExecutionState(String(options.executionKey || context.executionKey).trim() || context.executionKey);
+    state.launchScheduled = true;
+
     const run = async () => {
       const sourceLabel = source === 'cli' ? 'CLI' : 'Telegram';
-      const providerLabel = formatProviderName(this.provider);
-      const resume = !this.forceNewNextPrompt;
+      const providerLabel = formatProviderName(context.provider);
       const abortController = new globalThis.AbortController();
       const groupedCount = Number.isFinite(options.groupedCount) ? Math.max(1, Number(options.groupedCount)) : 1;
+      const sourceThreadId = context.sourceThreadId;
       let lastProgressText = '';
       let progressChain = Promise.resolve();
       let progressMessageId = null;
       this.logCliEvent(`${sourceLabel} -> ${providerLabel}`, cleanPrompt);
-      this.activePromptAbortController = abortController;
-      this.activePromptSource = source;
-      this.activePromptAbortReason = null;
+      state.activeAbortController = abortController;
+      state.activeSource = source;
+      state.activeAbortReason = null;
+      state.launchScheduled = false;
 
       try {
+        if (source === 'telegram' && Number.isInteger(sourceThreadId) && this.telegramForumState?.enabled) {
+          this.telegramThreadId = sourceThreadId;
+        }
+
         if (source === 'telegram') {
           let progressMessageText = '';
           if (groupedCount > 1) {
@@ -2310,13 +2572,15 @@ class Bridge {
             progressMessageText = `${providerLabel} is working...`;
           }
 
-          const progressMessage = await this.safeSendMessage(progressMessageText);
+          const progressMessage = await this.safeSendMessage(progressMessageText, {
+            messageThreadId: sourceThreadId,
+          });
           if (Number.isInteger(progressMessage?.message_id)) {
             progressMessageId = progressMessage.message_id;
           }
         }
 
-        const response = await this.runProvider(cleanPrompt, resume, {
+        const response = await this.runProviderWithContext(cleanPrompt, context, {
           abortSignal: abortController.signal,
           onProgress: progressMessage => {
             const normalized = String(progressMessage || '').trim();
@@ -2339,7 +2603,7 @@ class Bridge {
                 }
 
                 await this.telegram.editMessageText(this.config.telegramChatId, progressMessageId, nextProgressText, {
-                  messageThreadId: this.getActiveTelegramThreadId(),
+                  messageThreadId: sourceThreadId,
                 });
               })
               .catch(() => null);
@@ -2351,39 +2615,42 @@ class Bridge {
             : null,
         });
 
-        if (this.sessionMode === 'new') {
-          this.sessionMode = 'latest';
-          this.forceNewNextPrompt = false;
-        }
-        this.persistWorkspaceState();
+        await progressChain.catch(() => null);
+        this.finalizeExecutionContext(context);
         this.lastExchange = {
           source,
           prompt: cleanPrompt,
           response: String(response || '').trim() || 'No response.',
         };
-        await this.safeSendMessage(response, { from: providerLabel });
+        await this.safeSendMessage(response, {
+          from: providerLabel,
+          messageThreadId: sourceThreadId,
+        });
       } catch (error) {
         if (abortController.signal.aborted || this.isPromptAbortError(error)) {
           return;
         }
 
-        await this.safeSendMessage(`Error: ${error.message}`);
+        await this.safeSendMessage(`Error: ${error.message}`, {
+          messageThreadId: sourceThreadId,
+        });
         this.logger.error(`Provider execution failed: ${error.message}`);
       } finally {
-        if (this.activePromptAbortController === abortController) {
-          this.activePromptAbortController = null;
-          this.activePromptSource = null;
-          this.activePromptAbortReason = null;
+        if (state.activeAbortController === abortController) {
+          state.activeAbortController = null;
+          state.activeSource = null;
+          state.activeAbortReason = null;
         }
+        state.launchScheduled = false;
 
-        if (this.telegramPendingMessages.length > 0 && !this.telegramDispatchScheduled) {
+        if (this.telegramPendingMessages.length > 0) {
           this.startTelegramDispatch(true);
         }
       }
     };
 
-    this.promptQueue = this.promptQueue.then(run, run);
-    await this.promptQueue;
+    state.promptQueue = state.promptQueue.then(run, run);
+    await state.promptQueue;
   }
 
   async runPairingFlow(options = {}) {
@@ -2615,7 +2882,7 @@ class Bridge {
           continue;
         }
 
-        await this.handleMessage(message.text || '');
+        await this.handleMessage(message);
       }
     } catch (error) {
       if (error instanceof TelegramApiError && error.status === 401) {
@@ -2629,8 +2896,12 @@ class Bridge {
     }
   }
 
-  async handleMessage(rawText) {
-    const text = String(rawText || '').trim();
+  async handleMessage(messageOrText) {
+    const message =
+      messageOrText && typeof messageOrText === 'object'
+        ? messageOrText
+        : { text: messageOrText };
+    const text = String(message?.text || '').trim();
     if (!text) {
       return;
     }
@@ -2646,7 +2917,11 @@ class Bridge {
       return;
     }
 
-    await this.enqueueTelegramPrompt(text);
+    await this.enqueueTelegramPrompt(text, {
+      messageThreadId: Number.isInteger(message?.messageThreadId) ? message.messageThreadId : null,
+      workspacePath:
+        this.findForumTopicByThreadId(message?.messageThreadId)?.workspacePath || this.getCurrentWorkspacePath(),
+    });
   }
 
   async handleMainTopicMessage(message) {
@@ -2747,7 +3022,11 @@ class Bridge {
 
     try {
       const prepared = await this.attachmentHandler.createPrompt(message);
-      await this.enqueueTelegramPrompt(prepared.prompt);
+      await this.enqueueTelegramPrompt(prepared.prompt, {
+        messageThreadId: Number.isInteger(message?.messageThreadId) ? message.messageThreadId : null,
+        workspacePath:
+          this.findForumTopicByThreadId(message?.messageThreadId)?.workspacePath || this.getCurrentWorkspacePath(),
+      });
     } catch (error) {
       const messageText = error?.message ? String(error.message) : String(error);
       this.logger.error(`Attachment handling failed: ${messageText}`);
@@ -2880,8 +3159,9 @@ class Bridge {
     }
 
     if (command === '/stop') {
-      const stopped = this.requestStopCurrentPrompt('manual_stop');
-      const clearedCount = this.clearQueuedTelegramMessages();
+      const currentExecutionKey = this.getCurrentExecutionKey();
+      const stopped = this.requestStopCurrentPrompt('manual_stop', { executionKey: currentExecutionKey });
+      const clearedCount = this.clearQueuedTelegramMessages({ executionKey: currentExecutionKey });
 
       if (stopped) {
         await this.safeSendMessage(`Stopping current ${formatProviderName(this.provider)} request and clearing queued messages...`);

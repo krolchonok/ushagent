@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import os from 'node:os';
 
 const CLIENT_BUNDLE_VERSION = 1;

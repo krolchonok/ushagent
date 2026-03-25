@@ -59,18 +59,24 @@ export function setProviderSessionId(config, provider, sessionId) {
   config.set(definition.sessionKey, normalized);
 }
 
-export function createProviderRuntime(config, provider, providerArgs = []) {
+export function createProviderRuntime(config, provider, providerArgs = [], options = {}) {
   const definition = getProviderDefinition(provider);
   const extraArgs = Array.isArray(providerArgs) ? [...providerArgs] : [];
+  const customGetSessionId = typeof options.getSessionId === 'function' ? options.getSessionId : null;
+  const customSetSessionId = typeof options.setSessionId === 'function' ? options.setSessionId : null;
 
   return {
     id: definition.id,
     displayName: definition.displayName,
     extraArgs,
     getSessionId() {
-      return getProviderSessionId(config, definition.id);
+      return customGetSessionId ? customGetSessionId() : getProviderSessionId(config, definition.id);
     },
     setSessionId(sessionId) {
+      if (customSetSessionId) {
+        customSetSessionId(sessionId);
+        return;
+      }
       setProviderSessionId(config, definition.id, sessionId);
     },
     async run(prompt, options = {}) {

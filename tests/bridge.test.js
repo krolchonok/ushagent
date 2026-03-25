@@ -331,7 +331,7 @@ test('handleProjectSwitchCommand force aborts active prompt and switches workspa
     });
 
     let aborted = false;
-    bridge.activePromptAbortController = {
+    bridge.getExecutionState(bridge.getCurrentExecutionKey()).activeAbortController = {
       signal: { aborted: false },
     };
     bridge.requestStopCurrentPrompt = () => {
@@ -650,8 +650,8 @@ test('pollOnce switches workspace when message arrives in another project topic'
     };
 
     let handledText = null;
-    bridge.handleMessage = async text => {
-      handledText = text;
+    bridge.handleMessage = async message => {
+      handledText = message?.text || null;
     };
 
     await bridge.pollOnce();
@@ -660,6 +660,280 @@ test('pollOnce switches workspace when message arrives in another project topic'
     assert.equal(process.cwd(), projectB);
     assert.equal(bridge.telegramThreadId, 77);
     assert.equal(config.activeWorkspacePath, projectB);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('startTelegramDispatch groups only pending Telegram messages from the same topic', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    const dispatched = [];
+    bridge.queuePrompt = async (prompt, source, options) => {
+      dispatched.push({ prompt, source, options });
+      return new Promise(() => {});
+    };
+    bridge.telegramPendingMessages = [
+      { text: 'first', messageThreadId: 30 },
+      { text: 'second', messageThreadId: 30 },
+      { text: 'third', messageThreadId: 77 },
+    ];
+
+    bridge.startTelegramDispatch(true);
+
+    assert.equal(dispatched.length, 2);
+    assert.equal(dispatched[0].prompt, 'first\nsecond');
+    assert.equal(dispatched[0].source, 'telegram');
+    assert.equal(dispatched[0].options.groupedCount, 2);
+    assert.equal(dispatched[0].options.messageThreadId, 30);
+    assert.equal(dispatched[1].prompt, 'third');
+    assert.equal(dispatched[1].options.messageThreadId, 77);
+    assert.deepEqual(bridge.telegramPendingMessages, []);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('queuePrompt keeps progress and final response in the original Telegram topic', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    const sent = [];
+    const edits = [];
+    bridge.telegramThreadId = 30;
+    bridge.telegram = {
+      editMessageText: async (chatId, messageId, text, options = {}) => {
+        edits.push({ chatId, messageId, text, options });
+        return null;
+      },
+    };
+    bridge.safeSendMessage = async (text, options = {}) => {
+      sent.push({ text, options });
+      return { message_id: sent.length };
+    };
+    bridge.runProviderWithContext = async (_prompt, _context, hooks = {}) => {
+      bridge.telegramThreadId = 77;
+      hooks.onProgress?.('Inspecting files');
+      return 'done';
+    };
+
+    await bridge.queuePrompt('hello', 'telegram', { messageThreadId: 30 });
+
+    assert.equal(sent[0].options.messageThreadId, 30);
+    assert.equal(sent[1].options.messageThreadId, 30);
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0].options.messageThreadId, 30);
+    assert.equal(bridge.telegramThreadId, 77);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('queuePrompt keeps Telegram replies in the original topic while active topic changes', async () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const projectA = path.join(rootDir, 'project-a');
+  const projectB = path.join(rootDir, 'project-b');
+  mkdirSync(projectA);
+  mkdirSync(projectB);
+
+  const previousCwd = process.cwd();
+  process.chdir(projectA);
+
+  try {
+    const { bridge, config } = createBridge(projectA);
+    config.setWorkspace(projectB, {
+      label: 'project-b',
+      provider: 'codex',
+      codexArgs: config.codexArgs,
+      codexLastSessionId: null,
+      sessionMode: 'latest',
+      pinnedSessionId: null,
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {
+        'project:host:a': {
+          kind: 'project',
+          threadId: 30,
+          title: 'HOST | project-a',
+          hostname: os.hostname(),
+          workspacePath: projectA,
+        },
+        'project:host:b': {
+          kind: 'project',
+          threadId: 77,
+          title: 'HOST | project-b',
+          hostname: os.hostname(),
+          workspacePath: projectB,
+        },
+      },
+    };
+    bridge.telegramThreadId = 30;
+
+    const sent = [];
+    bridge.safeSendMessage = async (text, options = {}) => {
+      sent.push({ text, options });
+      if (text.includes('is working')) {
+        bridge.telegramThreadId = 77;
+      }
+      return { message_id: 101 };
+    };
+
+    const edits = [];
+    bridge.telegram = {
+      editMessageText: async (_chatId, messageId, text, options = {}) => {
+        edits.push({ messageId, text, options });
+        bridge.telegramThreadId = 77;
+        return null;
+      },
+    };
+
+    bridge.runProviderWithContext = async (_prompt, _context, hooks = {}) => {
+      hooks.onProgress?.('Inspecting files');
+      return 'Done.';
+    };
+
+    await bridge.queuePrompt('check topic binding', 'telegram', {
+      messageThreadId: 30,
+      workspacePath: projectA,
+    });
+
+    assert.equal(sent[0].options.messageThreadId, 30);
+    assert.equal(edits[0].options.messageThreadId, 30);
+    assert.equal(sent.at(-1).options.messageThreadId, 30);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('queuePrompt restores queued workspace before provider execution', async () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const projectA = path.join(rootDir, 'project-a');
+  const projectB = path.join(rootDir, 'project-b');
+  mkdirSync(projectA);
+  mkdirSync(projectB);
+
+  const previousCwd = process.cwd();
+  process.chdir(projectA);
+
+  try {
+    const { bridge, config } = createBridge(projectA);
+    config.setWorkspace(projectB, {
+      label: 'project-b',
+      provider: 'codex',
+      codexArgs: config.codexArgs,
+      codexLastSessionId: null,
+      sessionMode: 'latest',
+      pinnedSessionId: null,
+    });
+
+    let providerCwd = null;
+    bridge.safeSendMessage = async () => ({ message_id: 1 });
+    bridge.runProviderWithContext = async (_prompt, context) => {
+      providerCwd = context.workspacePath;
+      return 'Done.';
+    };
+
+    await bridge.queuePrompt('run in project b', 'telegram', {
+      messageThreadId: 77,
+      workspacePath: projectB,
+    });
+
+    assert.equal(providerCwd, projectB);
+    assert.equal(process.cwd(), projectA);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('startTelegramDispatch does not merge pending messages from different topics', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    const queued = [];
+    bridge.queuePrompt = async (prompt, source, options = {}) => {
+      queued.push({ prompt, source, options });
+    };
+
+    bridge.telegramPendingMessages = [
+      { text: 'first topic message', messageThreadId: 30, workspacePath: 'a' },
+      { text: 'second topic message', messageThreadId: 77, workspacePath: 'b' },
+    ];
+
+    bridge.startTelegramDispatch(true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.equal(queued.length, 2);
+    assert.equal(queued[0].prompt, 'first topic message');
+    assert.equal(queued[0].options.messageThreadId, 30);
+    assert.equal(queued[1].prompt, 'second topic message');
+    assert.equal(queued[1].options.messageThreadId, 77);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('queuePrompt runs project topics concurrently on separate execution keys', async () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const projectA = path.join(rootDir, 'project-a');
+  const projectB = path.join(rootDir, 'project-b');
+  mkdirSync(projectA);
+  mkdirSync(projectB);
+
+  const previousCwd = process.cwd();
+  process.chdir(projectA);
+
+  try {
+    const { bridge, config } = createBridge(projectA);
+    config.setWorkspace(projectB, {
+      label: 'project-b',
+      provider: 'codex',
+      codexArgs: config.codexArgs,
+      codexLastSessionId: null,
+      sessionMode: 'latest',
+      pinnedSessionId: null,
+    });
+
+    bridge.safeSendMessage = async () => ({ message_id: 1 });
+
+    const started = [];
+    const resolvers = [];
+    bridge.runProviderWithContext = (_prompt, context) =>
+      new Promise(resolve => {
+        started.push(context.workspacePath);
+        resolvers.push(() => resolve(`done:${path.basename(context.workspacePath)}`));
+      });
+
+    const first = bridge.queuePrompt('first', 'telegram', {
+      messageThreadId: 30,
+      workspacePath: projectA,
+    });
+    const second = bridge.queuePrompt('second', 'telegram', {
+      messageThreadId: 77,
+      workspacePath: projectB,
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.deepEqual(started.sort(), [projectA, projectB].sort());
+
+    resolvers[0]();
+    resolvers[1]();
+    await Promise.all([first, second]);
   } finally {
     process.chdir(previousCwd);
   }
