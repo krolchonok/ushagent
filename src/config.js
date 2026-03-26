@@ -46,7 +46,7 @@ class Config {
         topics: {},
       },
       telegramReplyKeyboard: {
-        enabled: true,
+        enabled: false,
         variant: 'standard',
       },
     };

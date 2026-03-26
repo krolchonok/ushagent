@@ -32,14 +32,81 @@ export function parseCodexProgressEvent(line) {
       }
     }
 
-    if (event.type === 'response_item' && event.payload?.type === 'function_call') {
-      const toolName = pickValue(event.payload?.name);
+    if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
+      const message = pickValue(event.item?.text) || extractFromContent(event.item?.content) || extractFromContent(event.item?.message);
+      if (isLikelyProgressMessage(message)) {
+        return {
+          kind: 'progress',
+          text: message,
+          phase: 'commentary',
+        };
+      }
+    }
+
+    if (event.type === 'item.started' && event.item?.type === 'command_execution') {
+      const commandText = pickValue(event.item?.command);
+      if (commandText) {
+        return {
+          kind: 'tool',
+          text: `Running ${toToolPreview(commandText)}`,
+        };
+      }
+    }
+
+    const toolPayload = event.payload || event.item || event.data || event.response || event.result || null;
+    const toolType = pickValue(toolPayload?.type);
+    if (toolType === 'function_call') {
+      const toolName = pickValue(toolPayload?.name);
       if (toolName) {
         return {
           kind: 'tool',
           text: `Running ${toolName}`,
         };
       }
+    }
+
+    const phase =
+      pickValue(event.phase) ||
+      pickValue(event.payload?.phase) ||
+      pickValue(event.data?.phase) ||
+      pickValue(event.item?.phase) ||
+      pickValue(event.response?.phase) ||
+      null;
+
+    const eventType = pickValue(event.type).toLowerCase();
+    const progressText =
+      extractFromContent(event.delta) ||
+      extractFromContent(event.payload?.delta) ||
+      extractFromContent(event.data?.delta) ||
+      extractFromContent(event.item?.delta) ||
+      pickValue(event.item?.text) ||
+      extractFromContent(event.payload?.message) ||
+      extractFromContent(event.payload?.content) ||
+      extractFromContent(event.payload?.output) ||
+      extractFromContent(event.data?.message) ||
+      extractFromContent(event.data?.content) ||
+      extractFromContent(event.data?.output) ||
+      extractFromContent(event.item?.message) ||
+      extractFromContent(event.item?.content) ||
+      extractFromContent(event.item?.output) ||
+      extractFromContent(event.response?.content) ||
+      extractFromContent(event.response?.output) ||
+      '';
+
+    if (
+      progressText &&
+      (Boolean(phase) ||
+        ((eventType.includes('delta') ||
+          eventType.includes('message') ||
+          eventType.includes('content') ||
+          eventType.includes('output')) &&
+          isLikelyProgressMessage(progressText)))
+    ) {
+      return {
+        kind: 'progress',
+        text: progressText,
+        phase: phase || null,
+      };
     }
   } catch {
     return null;
@@ -120,6 +187,29 @@ function extractFromContent(content, depth = 0) {
   }
 
   return '';
+}
+
+function toToolPreview(commandText) {
+  const normalized = String(commandText || '').trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return 'command';
+  }
+
+  return normalized.length <= 120 ? normalized : `${normalized.slice(0, 119)}...`;
+}
+
+function isLikelyProgressMessage(text) {
+  const normalized = String(text || '').trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const lines = normalized.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.length > 4) {
+    return false;
+  }
+
+  return normalized.length <= 280;
 }
 
 function formatTail(text, maxLines = 30, maxChars = 2000) {

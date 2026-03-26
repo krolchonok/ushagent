@@ -29,7 +29,7 @@ class FakeConfig {
         topics: {},
       },
       telegramReplyKeyboard: {
-        enabled: true,
+        enabled: false,
         variant: 'standard',
       },
     };
@@ -1032,6 +1032,77 @@ test('queuePrompt keeps Telegram replies in the original topic while active topi
   }
 });
 
+test('queuePrompt accumulates intermediate progress lines into one Telegram edit', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    const sent = [];
+    const edits = [];
+    bridge.safeSendMessage = async (text, options = {}) => {
+      sent.push({ text, options });
+      return { message_id: 101 };
+    };
+    bridge.telegram = {
+      editMessageText: async (_chatId, messageId, text, options = {}) => {
+        edits.push({ messageId, text, options });
+        return null;
+      },
+    };
+
+    bridge.runProviderWithContext = async (_prompt, _context, hooks = {}) => {
+      hooks.onProgress?.('Inspecting files', { phase: 'commentary' });
+      hooks.onProgress?.('Reading config', { phase: 'commentary' });
+      return 'done';
+    };
+
+    await bridge.queuePrompt('hello', 'telegram', { messageThreadId: 30 });
+
+    assert.equal(sent[0].options.messageThreadId, 30);
+    assert.equal(edits.length, 1);
+    assert.match(edits[0].text, /Inspecting files/);
+    assert.match(edits[0].text, /Reading config/);
+    assert.match(edits[0].text, /\[commentary\] Inspecting files/);
+    assert.match(edits[0].text, /\[commentary\] Reading config/);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('queuePrompt drops trailing progress entry when it duplicates the final response', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    const edits = [];
+    bridge.safeSendMessage = async () => ({ message_id: 101 });
+    bridge.telegram = {
+      editMessageText: async (_chatId, messageId, text, options = {}) => {
+        edits.push({ messageId, text, options });
+        return null;
+      },
+    };
+
+    bridge.runProviderWithContext = async (_prompt, _context, hooks = {}) => {
+      hooks.onProgress?.('Inspecting files', { phase: 'commentary' });
+      hooks.onProgress?.('Done.', { phase: 'commentary' });
+      return 'Done.';
+    };
+
+    await bridge.queuePrompt('hello', 'telegram', { messageThreadId: 30 });
+
+    assert.equal(edits.length, 1);
+    assert.match(edits[0].text, /Inspecting files/);
+    assert.doesNotMatch(edits[0].text, /\[commentary\] Done\./);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('queuePrompt restores queued workspace before provider execution', async () => {
   const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const projectA = path.join(rootDir, 'project-a');
@@ -1218,7 +1289,7 @@ test('safeSendMessage returns sent Telegram message so menu state can persist', 
   }
 });
 
-test('safeSendMessage applies persistent reply keyboard by default', async () => {
+test('safeSendMessage does not attach reply keyboard by default', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
   process.chdir(tmpDir);
@@ -1236,8 +1307,7 @@ test('safeSendMessage applies persistent reply keyboard by default', async () =>
 
     await bridge.safeSendMessage('hello');
 
-    assert.ok(Array.isArray(requestOptions.replyMarkup.keyboard));
-    assert.equal(requestOptions.replyMarkup.resize_keyboard, true);
+    assert.equal(requestOptions.replyMarkup, null);
   } finally {
     process.chdir(previousCwd);
   }
@@ -1265,9 +1335,9 @@ test('keyboard settings callback toggles reply keyboard config', async () => {
 
     await bridge.handleCallbackAction('keyboard:toggle', 'cb-1', 44, null);
 
-    assert.equal(config.telegramReplyKeyboard.enabled, false);
+    assert.equal(config.telegramReplyKeyboard.enabled, true);
     assert.match(published.text, /Reply keyboard settings/);
-    assert.equal(sent[0].options.replyMarkup.remove_keyboard, true);
+    assert.ok(Array.isArray(sent[0].options.replyMarkup.keyboard));
   } finally {
     process.chdir(previousCwd);
   }

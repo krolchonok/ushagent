@@ -48,6 +48,10 @@ class Logger {
   warn(msg) {
     this.log('warn', msg);
   }
+
+  info(msg) {
+    this.log('info', msg);
+  }
 }
 
 export default Logger;

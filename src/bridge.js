@@ -35,6 +35,10 @@ const DICTATION_HINT_TEXT = 'Hint: for voice input, use your phone keyboard dict
 const MAX_CONVERSATION_HISTORY = 40;
 const TELEGRAM_POLL_TIMEOUT_SEC = 5;
 const CODEX_LONG_RUNNING_NOTICE_MS = 20 * 60 * 1000;
+const TELEGRAM_PROGRESS_DEBOUNCE_MS = 700;
+const TELEGRAM_PROGRESS_HISTORY_LIMIT = 8;
+const TELEGRAM_PROGRESS_ENTRY_MAX_CHARS = 180;
+const TELEGRAM_PROGRESS_TEXT_MAX_CHARS = 3200;
 const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: 'help', description: 'Show available commands' },
   { command: 'keyboard', description: 'Configure reply keyboard buttons' },
@@ -179,6 +183,58 @@ function summarizeCodexEventLine(line) {
   }
 }
 
+function trimProgressEntry(text) {
+  const normalized = String(text || '')
+    .trim()
+    .replace(/\s+/g, ' ');
+  if (!normalized) {
+    return '';
+  }
+
+  return normalized.length <= TELEGRAM_PROGRESS_ENTRY_MAX_CHARS
+    ? normalized
+    : `${normalized.slice(0, TELEGRAM_PROGRESS_ENTRY_MAX_CHARS - 1)}…`;
+}
+
+function buildTelegramProgressText(providerLabel, entries = []) {
+  const body = entries.filter(Boolean).join('\n');
+  const combined = body ? `${providerLabel} is working...\n\n${body}` : `${providerLabel} is working...`;
+  if (combined.length <= TELEGRAM_PROGRESS_TEXT_MAX_CHARS) {
+    return combined;
+  }
+
+  const overflow = combined.length - TELEGRAM_PROGRESS_TEXT_MAX_CHARS + 1;
+  return `…${combined.slice(overflow)}`;
+}
+
+function stripProgressPhasePrefix(text) {
+  return String(text || '')
+    .trim()
+    .replace(/^\[[^\]]+\]\s*/, '')
+    .trim();
+}
+
+function normalizeProgressComparison(text) {
+  return stripProgressPhasePrefix(text)
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isDuplicateOfFinalResponse(progressEntry, responseText) {
+  const progressText = normalizeProgressComparison(progressEntry);
+  const responseNormalized = normalizeProgressComparison(responseText);
+  if (!progressText || !responseNormalized) {
+    return false;
+  }
+
+  return (
+    progressText === responseNormalized ||
+    responseNormalized.startsWith(progressText) ||
+    progressText.startsWith(responseNormalized)
+  );
+}
+
 function normalizeTelegramCommand(rawCommand) {
   const value = String(rawCommand || '').trim().toLowerCase();
   if (!value.startsWith('/')) {
@@ -287,7 +343,7 @@ class Bridge {
             : `UshAgent connected. Next message resumes ${this.describeResumeTarget(this.getBoundSessionId())}.`;
 
       const startupMessage = await this.safeSendMessage([startupHeadline, 'Send /help for available commands.', DICTATION_HINT_TEXT].join('\n\n'), {
-        replyMarkup: this.buildPersistentReplyKeyboard(),
+        replyMarkup: this.config.telegramReplyKeyboard.enabled ? this.buildPersistentReplyKeyboard() : this.buildReplyKeyboardRemoval(),
         silent: true,
       });
       if (Number.isInteger(startupMessage?.message_id)) {
@@ -2936,6 +2992,56 @@ class Bridge {
       let lastProgressText = '';
       let progressChain = Promise.resolve();
       let progressMessageId = null;
+      let progressEntries = [];
+      let progressFlushTimer = null;
+      let progressTextSnapshot = '';
+      const flushProgressUpdate = () => {
+        progressFlushTimer = null;
+        if (progressEntries.length === 0) {
+          return;
+        }
+
+        const nextProgressText = buildTelegramProgressText(providerLabel, progressEntries);
+        if (!nextProgressText.trim() || nextProgressText === progressTextSnapshot) {
+          return;
+        }
+
+        progressTextSnapshot = nextProgressText;
+        progressChain = progressChain
+          .then(async () => {
+            if (!Number.isInteger(progressMessageId)) {
+              this.logger.warn(`Skipping Telegram progress update for ${providerLabel}: progress message id is missing.`);
+              return;
+            }
+
+            try {
+              this.logger.info(
+                `Editing Telegram progress message ${progressMessageId} in thread ${Number.isInteger(sourceThreadId) ? sourceThreadId : '-'}: ${toLogPreview(nextProgressText)}`
+              );
+              await this.telegram.editMessageText(this.config.telegramChatId, progressMessageId, nextProgressText, {
+                messageThreadId: sourceThreadId,
+              });
+              this.logger.info(`Edited Telegram progress message ${progressMessageId} successfully.`);
+            } catch (error) {
+              const reason = error?.message ? String(error.message) : String(error);
+              this.logger.warn(`Failed to edit Telegram progress message ${progressMessageId}: ${reason}`);
+            }
+          })
+          .catch(() => null);
+      };
+      const scheduleProgressFlush = (force = false) => {
+        if (progressFlushTimer) {
+          globalThis.clearTimeout(progressFlushTimer);
+          progressFlushTimer = null;
+        }
+
+        if (force) {
+          flushProgressUpdate();
+          return;
+        }
+
+        progressFlushTimer = globalThis.setTimeout(flushProgressUpdate, TELEGRAM_PROGRESS_DEBOUNCE_MS);
+      };
       this.logCliEvent(`${sourceLabel} -> ${providerLabel}`, cleanPrompt);
       state.activeAbortController = abortController;
       state.activeSource = source;
@@ -2961,6 +3067,8 @@ class Bridge {
           });
           if (Number.isInteger(progressMessage?.message_id)) {
             progressMessageId = progressMessage.message_id;
+          } else {
+            this.logger.warn(`${providerLabel} progress message did not return a Telegram message id.`);
           }
 
           this.scheduleLongRunningNotice(state, context, providerLabel);
@@ -2968,39 +3076,46 @@ class Bridge {
 
         const response = await this.runProviderWithContext(cleanPrompt, context, {
           abortSignal: abortController.signal,
-          onProgress: progressMessage => {
+          onProgress: (progressMessage, progressEvent = null) => {
             const normalized = String(progressMessage || '').trim();
             if (!normalized || normalized === lastProgressText) {
               return;
             }
 
             lastProgressText = normalized;
-            this.logCliEvent(`${providerLabel} progress`, normalized);
+            const phaseSuffix = String(progressEvent?.phase || '').trim();
+            this.logCliEvent(phaseSuffix ? `${providerLabel} progress [${phaseSuffix}]` : `${providerLabel} progress`, normalized);
+            this.logger.info(
+              phaseSuffix
+                ? `${providerLabel} progress [${phaseSuffix}]: ${normalized}`
+                : `${providerLabel} progress: ${normalized}`
+            );
 
             if (source !== 'telegram') {
               return;
             }
 
-            const nextProgressText = `${providerLabel} is working...\n\n${normalized}`;
-            progressChain = progressChain
-              .then(async () => {
-                if (!Number.isInteger(progressMessageId)) {
-                  return;
-                }
+            const nextEntry = trimProgressEntry(phaseSuffix ? `[${phaseSuffix}] ${normalized}` : normalized);
+            if (progressEntries.at(-1) !== nextEntry) {
+              progressEntries = [...progressEntries, nextEntry].slice(-TELEGRAM_PROGRESS_HISTORY_LIMIT);
+            }
 
-                await this.telegram.editMessageText(this.config.telegramChatId, progressMessageId, nextProgressText, {
-                  messageThreadId: sourceThreadId,
-                });
-              })
-              .catch(() => null);
+            scheduleProgressFlush();
           },
-          onRawEvent: DEBUG_CODEX_STREAM
-            ? line => {
-                this.logCliEvent(`${providerLabel} stream`, summarizeCodexEventLine(line));
-              }
-            : null,
+          onRawEvent: line => {
+            const summary = summarizeCodexEventLine(line);
+            this.logger.info(`${providerLabel} raw: ${summary}`);
+            if (DEBUG_CODEX_STREAM) {
+              this.logCliEvent(`${providerLabel} stream`, summary);
+            }
+          },
         });
 
+        if (progressEntries.length > 0 && isDuplicateOfFinalResponse(progressEntries.at(-1), response)) {
+          progressEntries = progressEntries.slice(0, -1);
+        }
+
+        scheduleProgressFlush(true);
         await progressChain.catch(() => null);
         this.finalizeExecutionContext(context);
         this.lastExchange = {
@@ -3022,6 +3137,10 @@ class Bridge {
         });
         this.logger.error(`Provider execution failed: ${error.message}`);
       } finally {
+        if (progressFlushTimer) {
+          globalThis.clearTimeout(progressFlushTimer);
+          progressFlushTimer = null;
+        }
         this.clearLongRunningNotice(state);
         if (state.activeAbortController === abortController) {
           state.activeAbortController = null;
@@ -3599,10 +3718,7 @@ class Bridge {
   async safeSendMessage(text, options = {}) {
     const chatId = this.config.telegramChatId;
     const from = String(options.from || 'UshAgent').trim() || 'UshAgent';
-    const replyMarkup =
-      options.replyMarkup !== undefined
-        ? options.replyMarkup
-        : this.buildPersistentReplyKeyboard();
+    const replyMarkup = options.replyMarkup !== undefined ? options.replyMarkup : null;
 
     if (!chatId) {
       return;

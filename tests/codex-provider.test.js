@@ -52,3 +52,41 @@ test('parseCodexProgressEvent extracts commentary progress and session ids', () 
     text: 'Running shell_command',
   });
 });
+
+test('parseCodexProgressEvent extracts commentary from item.completed agent messages', () => {
+  const progress = parseCodexProgressEvent(
+    '{"type":"item.completed","item":{"type":"agent_message","text":"Inspecting live events"}}'
+  );
+
+  assert.deepEqual(progress, {
+    kind: 'progress',
+    text: 'Inspecting live events',
+    phase: 'commentary',
+  });
+});
+
+test('parseCodexProgressEvent extracts tool previews from item.started command execution events', () => {
+  const tool = parseCodexProgressEvent(
+    '{"type":"item.started","item":{"type":"command_execution","command":"pwsh -Command \\"Get-Process\\""}}'
+  );
+
+  assert.deepEqual(tool, {
+    kind: 'tool',
+    text: 'Running pwsh -Command "Get-Process"',
+  });
+});
+
+test('parseCodexProgressEvent ignores long agent messages that look like final output', () => {
+  const longText = 'A'.repeat(400);
+  const progress = parseCodexProgressEvent(
+    JSON.stringify({
+      type: 'item.completed',
+      item: {
+        type: 'agent_message',
+        text: longText,
+      },
+    })
+  );
+
+  assert.equal(progress, null);
+});
