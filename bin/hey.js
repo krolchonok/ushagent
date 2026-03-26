@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { confirm } from '@inquirer/prompts';
+import { confirm, password } from '@inquirer/prompts';
 import Config from '../src/config.js';
 import Logger from '../src/logger.js';
 import { applyDefaultBypassArgs, sanitizeProviderArgs } from '../src/args.js';
@@ -22,6 +22,16 @@ const args = process.argv.slice(2);
 const command = args[0];
 const logger = new Logger('ushagent');
 
+function getFlagValue(name, argv) {
+  const flagIndex = argv.findIndex(value => value === name);
+  if (flagIndex >= 0) {
+    return String(argv[flagIndex + 1] || '').trim();
+  }
+
+  const inline = argv.find(value => String(value || '').startsWith(`${name}=`));
+  return inline ? String(inline).slice(`${name}=`.length).trim() : '';
+}
+
 function showHelp() {
   console.log(`
 UshAgent: Telegram bridge for Codex.
@@ -33,7 +43,7 @@ Usage:
   ushagent reset              Reset Telegram setup (bot token + chat pairing)
   ushagent reset-config       Remove the entire local UshAgent config
   ushagent addclient          Generate a forum-mode bootstrap command for another computer
-  ushagent join-client --bundle <bundle>
+  ushagent join-client --bundle <bundle> [--token <bot-token>]
   ushagent --version          Show version number
 
 Examples:
@@ -407,17 +417,28 @@ async function main() {
 
   if (command === 'join-client') {
     const config = new Config();
-    const bundleFlagIndex = args.findIndex(value => value === '--bundle');
-    const bundle =
-      bundleFlagIndex >= 0
-        ? String(args[bundleFlagIndex + 1] || '').trim()
-        : (() => {
-            const inline = args.find(value => String(value || '').startsWith('--bundle='));
-            return inline ? String(inline).slice('--bundle='.length).trim() : '';
-          })();
+    const bundle = getFlagValue('--bundle', args);
 
     if (!bundle) {
       throw new Error('Missing required --bundle value.');
+    }
+
+    let botToken = getFlagValue('--token', args);
+    if (!botToken) {
+      if (process.stdin.isTTY && process.stdout.isTTY) {
+        botToken = String(
+          await password({
+            message: 'Enter the Telegram bot token for this computer:',
+            mask: '*',
+          })
+        ).trim();
+      } else {
+        throw new Error('Missing required --token value in non-interactive mode.');
+      }
+    }
+
+    if (!botToken) {
+      throw new Error('Telegram bot token is required.');
     }
 
     const force = args.includes('--yes') || args.includes('-y');
@@ -439,10 +460,10 @@ async function main() {
       return;
     }
 
-    const parsed = applyClientBootstrapBundle(config, bundle);
+    const parsed = applyClientBootstrapBundle(config, bundle, { botToken });
     console.log(`Client bootstrap applied for chat ${parsed.chatId}.`);
     console.log(`Provider: ${parsed.provider}`);
-    console.log(`Bot: ${parsed.botUsername ? `@${parsed.botUsername}` : 'configured'}`);
+    console.log('Bot token: configured');
     console.log('Next step: run `ushagent codex` on this computer.');
     return;
   }

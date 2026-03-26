@@ -475,7 +475,7 @@ test('pollOnce routes forum callback queries before topic command handlers', asy
   }
 });
 
-test('ensureTelegramForumContext starts in host control mode without creating project topic', async () => {
+test('ensureTelegramForumContext starts in host control mode without creating main or project topics', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
   process.chdir(tmpDir);
@@ -493,10 +493,11 @@ test('ensureTelegramForumContext starts in host control mode without creating pr
 
     await bridge.ensureTelegramForumContext('chat-1');
 
-    assert.deepEqual(createdTopics, ['MAIN', `HOST: ${os.hostname()}`]);
+    assert.deepEqual(createdTopics, [`HOST: ${os.hostname()}`]);
     assert.equal(bridge.telegramForumState.projectThreadId, null);
+    assert.equal(bridge.telegramForumState.mainThreadId, null);
     assert.equal(bridge.telegramThreadId, bridge.telegramForumState.hostThreadId);
-    assert.equal(config.telegramForum.topics.main.title, 'MAIN');
+    assert.equal(config.telegramForum.topics.main, undefined);
     assert.equal(config.telegramForum.topics[`host:${os.hostname().trim().toLowerCase()}`].kind, 'host');
   } finally {
     process.chdir(previousCwd);
@@ -681,6 +682,81 @@ test('pollOnce switches workspace when message arrives in another project topic'
   }
 });
 
+test('pollOnce ignores project topics owned by another host', async () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const projectA = path.join(rootDir, 'project-a');
+  const foreignProject = path.join(rootDir, 'project-foreign');
+  mkdirSync(projectA);
+  mkdirSync(foreignProject);
+
+  const previousCwd = process.cwd();
+  process.chdir(projectA);
+
+  try {
+    const { bridge, config } = createBridge(projectA);
+    config.setWorkspace(foreignProject, {
+      label: 'project-foreign',
+      provider: 'codex',
+      codexArgs: config.codexArgs,
+      codexLastSessionId: null,
+      sessionMode: 'latest',
+      pinnedSessionId: null,
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {
+        'project:local:a': {
+          kind: 'project',
+          threadId: 30,
+          title: 'LOCAL | project-a',
+          hostname: os.hostname(),
+          workspacePath: projectA,
+        },
+        'project:foreign:b': {
+          kind: 'project',
+          threadId: 77,
+          title: 'FOREIGN | project-foreign',
+          hostname: 'foreign-host',
+          workspacePath: foreignProject,
+        },
+      },
+    };
+    bridge.telegramThreadId = 30;
+    bridge.telegram = {
+      getUpdates: async () => ({
+        nextCursor: 1,
+        messages: [
+          {
+            type: 'text',
+            chatId: 'chat-1',
+            userId: 'user-1',
+            messageId: 55,
+            messageThreadId: 77,
+            text: 'foreign topic message',
+          },
+        ],
+      }),
+    };
+
+    let handled = false;
+    bridge.handleMessage = async () => {
+      handled = true;
+    };
+
+    await bridge.pollOnce();
+
+    assert.equal(handled, false);
+    assert.equal(process.cwd(), projectA);
+    assert.equal(bridge.telegramThreadId, 30);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('syncForumWorkspaceForThread restores session binding from the target project topic', () => {
   const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const projectA = path.join(rootDir, 'project-a');
@@ -741,6 +817,64 @@ test('syncForumWorkspaceForThread restores session binding from the target proje
     assert.equal(bridge.sessionMode, 'pinned');
     assert.equal(bridge.getLastSessionId(), 'topic-session-b');
     assert.equal(bridge.getBoundSessionId(), 'topic-session-b');
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('syncForumWorkspaceForThread ignores foreign-host project topics', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const projectA = path.join(rootDir, 'project-a');
+  const foreignProject = path.join(rootDir, 'project-foreign');
+  mkdirSync(projectA);
+  mkdirSync(foreignProject);
+
+  const previousCwd = process.cwd();
+  process.chdir(projectA);
+
+  try {
+    const { bridge } = createBridge(projectA, {
+      sessionMode: 'latest',
+      lastSessionId: 'session-a',
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: 'chat-1',
+      mainThreadId: 10,
+      hostThreadId: 20,
+      projectThreadId: 30,
+      topics: {
+        'project:local:a': {
+          kind: 'project',
+          threadId: 30,
+          title: 'LOCAL | project-a',
+          hostname: os.hostname(),
+          workspacePath: projectA,
+          codexLastSessionId: 'topic-session-a',
+          sessionMode: 'latest',
+          pinnedSessionId: null,
+        },
+        'project:foreign:b': {
+          kind: 'project',
+          threadId: 77,
+          title: 'FOREIGN | project-foreign',
+          hostname: 'foreign-host',
+          workspacePath: foreignProject,
+          codexLastSessionId: 'topic-session-b',
+          sessionMode: 'pinned',
+          pinnedSessionId: 'topic-session-b',
+        },
+      },
+    };
+    bridge.telegramThreadId = 30;
+
+    const result = bridge.syncForumWorkspaceForThread(77);
+
+    assert.equal(result, null);
+    assert.equal(process.cwd(), projectA);
+    assert.equal(bridge.telegramThreadId, 30);
+    assert.equal(bridge.sessionMode, 'latest');
+    assert.equal(bridge.getLastSessionId(), 'topic-session-a');
   } finally {
     process.chdir(previousCwd);
   }
@@ -962,6 +1096,48 @@ test('startTelegramDispatch does not merge pending messages from different topic
     assert.equal(queued[0].prompt, 'first topic message');
     assert.equal(queued[0].options.messageThreadId, 30);
     assert.equal(queued[1].prompt, 'second topic message');
+    assert.equal(queued[1].options.messageThreadId, 77);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('startTelegramDispatch reruns automatically when a new topic message arrives during dispatch', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    const queued = [];
+    let injected = false;
+    bridge.queuePrompt = async (prompt, source, options = {}) => {
+      queued.push({ prompt, source, options });
+      if (!injected) {
+        injected = true;
+        bridge.telegramPendingMessages.push({
+          text: 'late topic message',
+          messageThreadId: 77,
+          workspacePath: tmpDir,
+          executionKey: 'telegram:77',
+        });
+      }
+    };
+
+    bridge.telegramPendingMessages = [
+      {
+        text: 'first topic message',
+        messageThreadId: 30,
+        workspacePath: tmpDir,
+        executionKey: 'telegram:30',
+      },
+    ];
+
+    bridge.startTelegramDispatch(true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.equal(queued.length, 2);
+    assert.equal(queued[0].options.messageThreadId, 30);
     assert.equal(queued[1].options.messageThreadId, 77);
   } finally {
     process.chdir(previousCwd);

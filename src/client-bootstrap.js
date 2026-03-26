@@ -16,19 +16,8 @@ function normalizeProviderArgs(providerArgs) {
 }
 
 export function createClientBootstrapBundle(config) {
-  const tokenInfo =
-    typeof config?.getTelegramBotTokenInfo === 'function'
-      ? config.getTelegramBotTokenInfo()
-      : {
-          token: String(config?.telegramBotToken || '').trim(),
-        };
-  const botToken = String(tokenInfo?.token || '').trim();
   const chatId = String(config?.telegramChatId || '').trim();
   const forum = config?.telegramForum;
-
-  if (!botToken) {
-    throw new Error('Telegram bot token is not configured.');
-  }
 
   if (!chatId) {
     throw new Error('Telegram chat is not paired yet.');
@@ -42,12 +31,9 @@ export function createClientBootstrapBundle(config) {
   const payload = {
     version: CLIENT_BUNDLE_VERSION,
     mode: CLIENT_BUNDLE_MODE_FORUM,
-    botToken,
     chatId,
     provider: String(config?.provider || 'codex').trim() || 'codex',
     providerArgs: normalizeProviderArgs(config?.codexArgs),
-    botUsername: String(config?.telegramBotUsername || '').trim() || null,
-    botId: config?.telegramBotId === undefined || config?.telegramBotId === null ? null : String(config.telegramBotId),
     issuedAt,
     issuerHost: os.hostname(),
   };
@@ -76,36 +62,37 @@ export function parseClientBootstrapBundle(bundle) {
     throw new Error('Only forum-mode bootstrap bundles are supported.');
   }
 
-  const botToken = String(payload?.botToken || '').trim();
   const chatId = String(payload?.chatId || '').trim();
-  if (!botToken || !chatId) {
+  if (!chatId) {
     throw new Error('Bootstrap bundle is missing required fields.');
   }
 
   return {
     version: CLIENT_BUNDLE_VERSION,
     mode: CLIENT_BUNDLE_MODE_FORUM,
-    botToken,
     chatId,
     provider: String(payload?.provider || 'codex').trim() || 'codex',
     providerArgs: normalizeProviderArgs(payload?.providerArgs),
-    botUsername: String(payload?.botUsername || '').trim() || null,
-    botId: payload?.botId === undefined || payload?.botId === null ? null : String(payload.botId),
     issuedAt: String(payload?.issuedAt || '').trim() || null,
     issuerHost: String(payload?.issuerHost || '').trim() || null,
   };
 }
 
-export function applyClientBootstrapBundle(config, bundle) {
+export function applyClientBootstrapBundle(config, bundle, options = {}) {
   const parsed = parseClientBootstrapBundle(bundle);
+  const botToken = String(options.botToken || '').trim();
+
+  if (!botToken) {
+    throw new Error('Telegram bot token is required.');
+  }
 
   config.clearPairing({ keepBotToken: false });
   config.setMany({
     provider: parsed.provider,
     codexArgs: parsed.provider === 'codex' ? parsed.providerArgs : config.codexArgs,
-    telegramBotToken: parsed.botToken,
-    telegramBotUsername: parsed.botUsername,
-    telegramBotId: parsed.botId,
+    telegramBotToken: botToken,
+    telegramBotUsername: null,
+    telegramBotId: null,
     telegramChatId: parsed.chatId,
     telegramChatUserId: null,
     telegramUpdateCursor: 0,

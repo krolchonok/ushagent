@@ -41,7 +41,6 @@ test('client bootstrap bundle round-trips forum config', () => {
 
     assert.equal(parsed.mode, 'forum');
     assert.equal(parsed.chatId, '-1001');
-    assert.equal(parsed.botUsername, 'forumbot');
     assert.deepEqual(parsed.providerArgs, ['--dangerously-bypass-approvals-and-sandbox']);
   } finally {
     if (previousHome === undefined) {
@@ -84,12 +83,14 @@ test('applyClientBootstrapBundle stores forum bootstrap in config', () => {
 
     const bundle = createClientBootstrapBundle(sourceConfig);
     const targetConfig = new Config();
-    const parsed = applyClientBootstrapBundle(targetConfig, bundle);
+    const parsed = applyClientBootstrapBundle(targetConfig, bundle, {
+      botToken: '654321:new_token_token_token',
+    });
 
     assert.equal(parsed.chatId, '-1001');
     assert.equal(targetConfig.telegramChatId, '-1001');
-    assert.equal(targetConfig.getStoredTelegramBotToken(), '123456:token_token_token_token');
-    assert.equal(targetConfig.telegramBotUsername, 'forumbot');
+    assert.equal(targetConfig.getStoredTelegramBotToken(), '654321:new_token_token_token');
+    assert.equal(targetConfig.telegramBotUsername, null);
     assert.equal(targetConfig.telegramForum.enabled, false);
     assert.deepEqual(targetConfig.codexArgs, ['--dangerously-bypass-approvals-and-sandbox']);
   } finally {

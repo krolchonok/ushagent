@@ -52,7 +52,6 @@ const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: 'last', description: 'Show the last completed exchange' },
   { command: 'stop', description: 'Stop current execution and clear queue' },
 ]);
-const MAIN_TOPIC_KEY = 'main';
 const DEBUG_CODEX_STREAM = /^(1|true|yes|on)$/i.test(String(process.env.USHAGENT_CODEX_DEBUG_STREAM || '').trim());
 
 function sanitizeTopicSegment(value, fallback = 'unknown') {
@@ -355,6 +354,25 @@ class Bridge {
     return null;
   }
 
+  isCurrentHostForumTopic(topic) {
+    if (!topic) {
+      return false;
+    }
+
+    if (topic.kind !== 'host' && topic.kind !== 'project') {
+      return true;
+    }
+
+    const topicHostname = String(topic.hostname || '').trim().toLowerCase();
+    const currentHostname = String(os.hostname() || '').trim().toLowerCase();
+    return Boolean(topicHostname) && topicHostname === currentHostname;
+  }
+
+  findCurrentHostForumTopicByThreadId(threadId) {
+    const topic = this.findForumTopicByThreadId(threadId);
+    return this.isCurrentHostForumTopic(topic) ? topic : null;
+  }
+
   listForumTopicsByKind(kind, options = {}) {
     const topics = Object.entries(this.getForumTopics())
       .filter(([, topic]) => topic?.kind === kind)
@@ -421,9 +439,6 @@ class Bridge {
       return record;
     };
 
-    const mainTopic = await ensureTopic(MAIN_TOPIC_KEY, 'MAIN', {
-      kind: 'main',
-    });
     const hostTopicKey = getHostTopicKey(hostname);
     const hostTopic = await ensureTopic(hostTopicKey, buildHostTopicTitle(hostname), {
       kind: 'host',
@@ -433,7 +448,7 @@ class Bridge {
     this.telegramForumState = {
       enabled: true,
       chatId,
-      mainThreadId: mainTopic.threadId,
+      mainThreadId: null,
       topics,
       hostTopicKey,
       hostThreadId: hostTopic.threadId,
@@ -444,7 +459,7 @@ class Bridge {
     this.config.setTelegramForum({
       enabled: true,
       chatId,
-      mainThreadId: mainTopic.threadId,
+      mainThreadId: null,
       topics,
     });
 
@@ -502,7 +517,7 @@ class Bridge {
       ...(this.telegramForumState || currentForum),
       enabled: true,
       chatId,
-      mainThreadId: Number.isInteger(currentForum.mainThreadId) ? currentForum.mainThreadId : this.telegramForumState?.mainThreadId ?? null,
+      mainThreadId: null,
       topics,
       hostTopicKey,
       projectTopicKey,
@@ -513,7 +528,7 @@ class Bridge {
     this.config.setTelegramForum({
       enabled: true,
       chatId,
-      mainThreadId: this.telegramForumState.mainThreadId,
+      mainThreadId: null,
       topics,
     });
 
@@ -806,7 +821,7 @@ class Bridge {
   buildNewProjectHelpText() {
     return [
       'To add a project in forum mode:',
-      '1. Open `MAIN` or `HOST`.',
+      '1. Open `HOST`.',
       '2. Press `Add Project`.',
       '3. Pick a known workspace from the list.',
       '4. UshAgent will create the topic if needed.',
@@ -831,10 +846,7 @@ class Bridge {
           { text: 'Status', callback_data: 'status' },
         ],
         [{ text: 'Keyboard', callback_data: 'keyboard:settings' }],
-        [
-          { text: 'Host', callback_data: 'forum:open_host' },
-          { text: 'Main', callback_data: 'forum:open_main' },
-        ],
+        [{ text: 'Host', callback_data: 'forum:open_host' }],
         [
           { text: 'Latest', callback_data: 'mode:latest' },
           { text: 'New', callback_data: 'mode:new' },
@@ -868,7 +880,11 @@ class Bridge {
     return {
       inline_keyboard: [
         [
+          { text: 'Hosts', callback_data: 'hosts' },
           { text: 'Projects', callback_data: 'projects' },
+        ],
+        [
+          { text: 'Current Project', callback_data: 'main:current_project' },
           { text: 'Add Project', callback_data: 'forum:add_project' },
         ],
         [
@@ -876,7 +892,6 @@ class Bridge {
           { text: 'Status', callback_data: 'status' },
         ],
         [{ text: 'Keyboard', callback_data: 'keyboard:settings' }],
-        [{ text: 'Main', callback_data: 'forum:open_main' }],
       ],
     };
   }
@@ -967,7 +982,7 @@ class Bridge {
     }
 
     if (messageThreadId === this.telegramForumState.mainThreadId) {
-      return this.buildMainKeyboard();
+      return this.buildHostKeyboard();
     }
 
     if (messageThreadId === this.telegramForumState.hostThreadId) {
@@ -1270,7 +1285,7 @@ class Bridge {
       return null;
     }
 
-    const topic = this.findForumTopicByThreadId(messageThreadId);
+    const topic = this.findCurrentHostForumTopicByThreadId(messageThreadId);
     if (!topic || topic.kind !== 'project') {
       return null;
     }
@@ -1284,7 +1299,7 @@ class Bridge {
       return null;
     }
 
-    const topic = this.findForumTopicByThreadId(messageThreadId);
+    const topic = this.findCurrentHostForumTopicByThreadId(messageThreadId);
     if (!topic || topic.kind !== 'project') {
       return null;
     }
@@ -1302,7 +1317,7 @@ class Bridge {
       return null;
     }
 
-    const topic = this.findForumTopicByThreadId(messageThreadId);
+    const topic = this.findCurrentHostForumTopicByThreadId(messageThreadId);
     if (!topic || topic.kind !== 'project') {
       return null;
     }
@@ -1368,7 +1383,7 @@ class Bridge {
       return null;
     }
 
-    const topic = this.findForumTopicByThreadId(messageThreadId);
+    const topic = this.findCurrentHostForumTopicByThreadId(messageThreadId);
     if (!topic || topic.kind !== 'project' || !topic.workspacePath) {
       return topic;
     }
@@ -1490,10 +1505,10 @@ class Bridge {
 
       if (action === 'forum:open_main') {
         await this.telegram.answerCallbackQuery(callbackQueryId);
-        await this.publishTelegramView(this.buildMainTopicText(), {
+        await this.publishTelegramView(this.buildCurrentHostTopicText(), {
           messageId,
-          messageThreadId,
-          replyMarkup: this.buildMainKeyboard(),
+          messageThreadId: this.telegramForumState?.hostThreadId ?? messageThreadId,
+          replyMarkup: this.buildHostKeyboard(),
           persistMenu: true,
         });
         return;
@@ -1569,8 +1584,8 @@ class Bridge {
         await this.telegram.answerCallbackQuery(callbackQueryId);
         await this.publishTelegramView(this.buildCurrentHostTopicText(), {
           messageId,
-          messageThreadId,
-          replyMarkup,
+          messageThreadId: this.telegramForumState?.hostThreadId ?? messageThreadId,
+          replyMarkup: this.buildHostKeyboard(),
           persistMenu: true,
         });
         return;
@@ -1592,8 +1607,8 @@ class Bridge {
         if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.mainThreadId) {
           await this.publishTelegramView(this.buildForumProjectListText(), {
             messageId,
-            messageThreadId,
-            replyMarkup,
+            messageThreadId: this.telegramForumState?.hostThreadId ?? messageThreadId,
+            replyMarkup: this.buildHostKeyboard(),
             persistMenu: true,
           });
           return;
@@ -1628,10 +1643,10 @@ class Bridge {
       if (action === 'menu') {
         await this.telegram.answerCallbackQuery(callbackQueryId);
         if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.mainThreadId) {
-          await this.publishTelegramView(this.buildMainTopicText(), {
+          await this.publishTelegramView(this.buildCurrentHostTopicText(), {
             messageId,
-            messageThreadId,
-            replyMarkup,
+            messageThreadId: this.telegramForumState?.hostThreadId ?? messageThreadId,
+            replyMarkup: this.buildHostKeyboard(),
             persistMenu: true,
           });
           return;
@@ -1674,10 +1689,10 @@ class Bridge {
       if (action === 'status') {
         await this.telegram.answerCallbackQuery(callbackQueryId);
         if (this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.mainThreadId) {
-          await this.publishTelegramView(this.buildMainTopicText(), {
+          await this.publishTelegramView(this.buildCurrentHostTopicText(), {
             messageId,
-            messageThreadId,
-            replyMarkup,
+            messageThreadId: this.telegramForumState?.hostThreadId ?? messageThreadId,
+            replyMarkup: this.buildHostKeyboard(),
             persistMenu: true,
           });
           return;
@@ -2808,6 +2823,7 @@ class Bridge {
     }
 
     this.telegramDispatchScheduled = true;
+    let rerunNeeded = false;
     try {
       let launched = false;
 
@@ -2866,6 +2882,13 @@ class Bridge {
       }
     } finally {
       this.telegramDispatchScheduled = false;
+      rerunNeeded = this.running && this.telegramPendingMessages.length > 0;
+    }
+
+    if (rerunNeeded) {
+      globalThis.queueMicrotask(() => {
+        this.startTelegramDispatch(groupAll);
+      });
     }
   }
 
@@ -3201,7 +3224,7 @@ class Bridge {
 
         const threadTopic =
           this.telegramForumState?.enabled && Number.isInteger(message.messageThreadId)
-            ? this.findForumTopicByThreadId(message.messageThreadId)
+            ? this.findCurrentHostForumTopicByThreadId(message.messageThreadId)
             : null;
 
         if (message.type === 'callback') {
@@ -3357,10 +3380,18 @@ class Bridge {
       return;
     }
 
+    if (command === '/hosts') {
+      await this.publishTelegramView(this.buildHostListText(), {
+        messageThreadId: message.messageThreadId,
+        replyMarkup: this.buildHostKeyboard(),
+      });
+      return;
+    }
+
     if (command === '/status' || command === '/menu' || command === '/help') {
       await this.publishTelegramView(this.buildHostTopicText(hostTopic), {
         messageThreadId: message.messageThreadId,
-        replyMarkup: this.buildControlKeyboard(),
+        replyMarkup: this.buildHostKeyboard(),
       });
     }
   }
