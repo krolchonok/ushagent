@@ -264,6 +264,26 @@ function isTelegramCommandForBot(rawCommand, botUsername) {
   return Boolean(mentionedBot && normalizedBotUsername && mentionedBot === normalizedBotUsername);
 }
 
+function isExplicitTelegramCommandForBot(rawCommand, botUsername) {
+  const value = String(rawCommand || '')
+    .trim()
+    .toLowerCase();
+  if (!value.startsWith('/')) {
+    return false;
+  }
+
+  const mentionIndex = value.indexOf('@');
+  if (mentionIndex <= 0) {
+    return false;
+  }
+
+  const mentionedBot = value.slice(mentionIndex + 1).trim();
+  const normalizedBotUsername = String(botUsername || '')
+    .trim()
+    .toLowerCase();
+  return Boolean(mentionedBot && normalizedBotUsername && mentionedBot === normalizedBotUsername);
+}
+
 function formatHistoryTimestamp(value) {
   return new Date(value).toLocaleTimeString();
 }
@@ -1894,6 +1914,12 @@ class Bridge {
       } catch {
         // Ignore callback answer failures.
       }
+
+      if (Number.isInteger(messageThreadId)) {
+        await this.safeSendMessage(`Action failed: ${error.message}`, {
+          messageThreadId,
+        });
+      }
     }
   }
 
@@ -2007,8 +2033,20 @@ class Bridge {
       return;
     }
 
+    let topic = null;
     const existing = this.getForumProjectTopicRecord(targetPath, os.hostname());
-    const topic = existing || (await this.ensureTelegramProjectTopic(this.config.telegramChatId, targetPath, os.hostname()));
+    try {
+      topic = existing || (await this.ensureTelegramProjectTopic(this.config.telegramChatId, targetPath, os.hostname()));
+    } catch (error) {
+      const reason = String(error?.message || error);
+      if (/already exists|topic.+exists/i.test(reason)) {
+        throw new Error(
+          `Failed to create topic for ${targetPath}. Telegram reports that the topic may already exist, but it is missing from local topic registry.`
+        );
+      }
+      throw error;
+    }
+
     const message = [
       `Project topic ready: ${topic?.title || formatWorkspaceLabel(targetPath)}`,
       `Workspace: ${targetPath}`,
@@ -3362,7 +3400,15 @@ class Bridge {
         }
 
         if (this.telegramForumState?.enabled) {
+          const commandToken = String(message.text || '')
+            .trim()
+            .split(/\s+/)[0];
+
           if (!threadTopic && message.messageThreadId !== mainThreadId && message.messageThreadId !== hostThreadId) {
+            if (isExplicitTelegramCommandForBot(commandToken, this.config.telegramBotUsername)) {
+              this.telegramThreadId = message.messageThreadId;
+              await this.handleMessage(message);
+            }
             continue;
           }
 

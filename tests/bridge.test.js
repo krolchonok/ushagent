@@ -1654,6 +1654,112 @@ test('handleHostTopicMessage ignores Telegram commands addressed to another bot'
   }
 });
 
+test('pollOnce handles explicit bot commands in unknown forum topics and replies in the same thread', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    bridge.running = true;
+    config.setMany({
+      telegramChatId: '-1001',
+      telegramChatUserId: null,
+      telegramUpdateCursor: 0,
+      telegramBotUsername: 'forumbot',
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: '-1001',
+      mainThreadId: null,
+      hostThreadId: 1218,
+      topics: {
+        'host:test-host': {
+          threadId: 1218,
+          title: 'HOST: test-host',
+          kind: 'host',
+          hostname: 'test-host',
+        },
+      },
+    };
+    bridge.safeSendMessage = Bridge.prototype.safeSendMessage.bind(bridge);
+
+    const sent = [];
+    bridge.telegram = {
+      getUpdates: async () => ({
+        nextCursor: 10,
+        messages: [
+          {
+            chatId: '-1001',
+            chatType: 'supergroup',
+            userId: 'user-1',
+            messageThreadId: 9999,
+            text: '/help@forumbot',
+          },
+        ],
+      }),
+      sendMessage: async (chatId, text, options = {}) => {
+        sent.push({ chatId, text, options });
+        return { message_id: 1 };
+      },
+      editMessageText: async () => null,
+    };
+
+    await bridge.pollOnce();
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /UshAgent commands:/);
+    assert.equal(sent[0].chatId, '-1001');
+    assert.equal(sent[0].options.messageThreadId, 9999);
+    assert.equal(bridge.telegramThreadId, 9999);
+    assert.equal(config.telegramUpdateCursor, 10);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('handleCallbackAction surfaces create topic failures in the same forum thread', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    config.setMany({
+      telegramChatId: '-1001',
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: '-1001',
+      mainThreadId: null,
+      hostThreadId: 1218,
+      topics: {},
+    };
+    bridge.projectListCache = [{ path: tmpDir, label: path.basename(tmpDir) }];
+
+    const sent = [];
+    bridge.safeSendMessage = async (text, options = {}) => {
+      sent.push({ text, options });
+      return { message_id: 1 };
+    };
+    bridge.telegram = {
+      answerCallbackQuery: async () => null,
+    };
+    bridge.ensureTelegramProjectTopic = async () => {
+      throw new Error('Bad Request: TOPIC_ALREADY_EXISTS');
+    };
+
+    await bridge.handleCallbackAction('forum:create_topic:1', 'cb-1', 55, 1218);
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /Failed to create topic/);
+    assert.match(sent[0].text, /missing from local topic registry/);
+    assert.equal(sent[0].options.messageThreadId, 1218);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('handleCommand /history returns recent chat history', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
