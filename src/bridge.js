@@ -39,6 +39,7 @@ const TELEGRAM_PROGRESS_DEBOUNCE_MS = 700;
 const TELEGRAM_PROGRESS_HISTORY_LIMIT = 8;
 const TELEGRAM_PROGRESS_ENTRY_MAX_CHARS = 180;
 const TELEGRAM_PROGRESS_TEXT_MAX_CHARS = 3200;
+const TELEGRAM_RAW_UPDATE_LOG_MAX_CHARS = 2000;
 const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: 'help', description: 'Show available commands' },
   { command: 'keyboard', description: 'Configure reply keyboard buttons' },
@@ -288,6 +289,20 @@ function formatHistoryTimestamp(value) {
   return new Date(value).toLocaleTimeString();
 }
 
+function formatRawTelegramUpdate(update) {
+  try {
+    const serialized = JSON.stringify(update);
+    if (!serialized) {
+      return '(empty)';
+    }
+    return serialized.length > TELEGRAM_RAW_UPDATE_LOG_MAX_CHARS
+      ? `${serialized.slice(0, TELEGRAM_RAW_UPDATE_LOG_MAX_CHARS)}...`
+      : serialized;
+  } catch (error) {
+    return `Failed to serialize raw update: ${error.message}`;
+  }
+}
+
 function getTelegramBotCommands() {
   return TELEGRAM_BOT_COMMANDS.map(command => ({ ...command }));
 }
@@ -321,19 +336,27 @@ class Bridge {
     this.lastExchange = null;
     this.conversationHistory = [];
     this.isStopping = false;
+    this.shutdownForceTimer = null;
     this.telegramForumState = null;
     this.telegramThreadId = null;
 
     this.onSignal = () => {
       if (this.isStopping) {
+        process.stderr.write('\nForcing UshAgent exit.\n');
+        process.exit(130);
         return;
       }
       this.isStopping = true;
+      process.exitCode = 130;
       this.requestStopCurrentPrompt('shutdown', { all: true });
       this.clearQueuedTelegramMessages();
       this.running = false;
       this.stopLocalInputLoop();
       console.log('\nStopping UshAgent...');
+      this.shutdownForceTimer = globalThis.setTimeout(() => {
+        process.stderr.write('Shutdown is taking too long. Exiting now.\n');
+        process.exit(130);
+      }, 2000);
     };
   }
 
@@ -353,7 +376,11 @@ class Bridge {
       await mkdir(ATTACHMENT_DOWNLOAD_DIR, { recursive: true });
 
       const pairing = await this.ensureBridgeReady();
+      this.logger.info(`Bridge ready with chat ${pairing.chatId}. Initializing forum context.`);
       await this.ensureTelegramForumContext(pairing.chatId);
+      this.logger.info(
+        `Forum context initialized: enabled=${this.telegramForumState?.enabled === true}, hostThreadId=${this.telegramForumState?.hostThreadId ?? '-'}, projectThreadId=${this.telegramForumState?.projectThreadId ?? '-'}`
+      );
       this.attachmentHandler = await createAttachmentHandler({
         telegram: this.telegram,
         downloadDir: ATTACHMENT_DOWNLOAD_DIR,
@@ -396,6 +423,10 @@ class Bridge {
       }
     } finally {
       this.stopLocalInputLoop();
+      if (this.shutdownForceTimer) {
+        globalThis.clearTimeout(this.shutdownForceTimer);
+        this.shutdownForceTimer = null;
+      }
       if (this.sleepInhibitorState && typeof this.sleepInhibitorState.stop === 'function') {
         await this.sleepInhibitorState.stop();
       }
@@ -494,12 +525,14 @@ class Bridge {
 
   async ensureTelegramForumContext(chatId) {
     if (!this.telegram || !chatId) {
+      this.logger.info(`Skipping forum context initialization: telegram=${Boolean(this.telegram)}, chatId=${chatId || '-'}`);
       this.telegramForumState = null;
       this.telegramThreadId = null;
       return null;
     }
 
     const chat = await this.telegram.getChat(chatId);
+    this.logger.info(`Loaded Telegram chat ${chatId}: is_forum=${chat?.is_forum === true}`);
     if (chat?.is_forum !== true) {
       this.telegramForumState = {
         enabled: false,
@@ -515,6 +548,9 @@ class Bridge {
     const hostname = os.hostname();
     const currentForum = this.config.telegramForum;
     const topics = { ...currentForum.topics };
+    this.logger.info(
+      `Ensuring forum context for host ${hostname}. Known topics: ${Object.keys(topics).length}.`
+    );
 
     const ensureTopic = async (topicKey, title, extra = {}) => {
       const existing = topics[topicKey];
@@ -547,6 +583,7 @@ class Bridge {
       kind: 'host',
       hostname,
     });
+    this.logger.info(`Host topic ready: key=${hostTopicKey}, threadId=${hostTopic.threadId}, title=${hostTopic.title}`);
 
     this.telegramForumState = {
       enabled: true,
@@ -1535,6 +1572,9 @@ class Bridge {
     }
 
     const replyMarkup = this.getReplyMarkupForThread(messageThreadId);
+    this.logger.info(
+      `Handling callback query ${callbackQueryId || '-'}: action=${action}, messageId=${messageId ?? '-'}, threadId=${messageThreadId ?? '-'}`
+    );
 
     try {
       if (action === 'hosts') {
@@ -1907,6 +1947,7 @@ class Bridge {
       }
 
       await this.telegram.answerCallbackQuery(callbackQueryId, 'Unknown action.');
+      this.logger.warn(`Unknown callback action received: ${action}`);
     } catch (error) {
       this.logger.error(`Callback handling failed: ${error.message}`);
       try {
@@ -2221,9 +2262,19 @@ class Bridge {
     }
 
     try {
+      if (process.stdout.isTTY) {
+        readline.clearLine(process.stdout, 0);
+        readline.cursorTo(process.stdout, 0);
+      }
       this.localInputInterface.close();
     } catch {
       // Ignore close failures.
+    }
+
+    try {
+      process.stdin.pause();
+    } catch {
+      // Ignore stdin pause failures.
     }
 
     this.localInputInterface = null;
@@ -3362,8 +3413,17 @@ class Bridge {
     }
 
     try {
+      this.logger.info(`Polling Telegram updates: cursor=${cursor}, chatId=${chatId}`);
       const result = await this.telegram.getUpdates(cursor, TELEGRAM_POLL_TIMEOUT_SEC);
       const nextCursor = Number.isFinite(result.nextCursor) ? result.nextCursor : cursor;
+      this.logger.info(
+        `Telegram poll result: messages=${Array.isArray(result.messages) ? result.messages.length : 0}, cursor=${cursor}->${nextCursor}`
+      );
+      if (this.logger.shouldLogToConsole() && Array.isArray(result.rawUpdates)) {
+        for (const update of result.rawUpdates) {
+          this.logger.info(`Telegram raw update: ${formatRawTelegramUpdate(update)}`);
+        }
+      }
       if (nextCursor > cursor) {
         this.config.set('telegramUpdateCursor', nextCursor);
       }
@@ -3387,6 +3447,9 @@ class Bridge {
             : null;
 
         if (message.type === 'callback') {
+          this.logger.info(
+            `Incoming callback query ${message.callbackQueryId || '-'} in thread ${message.messageThreadId ?? '-'}: ${message.data || message.text || '(empty)'}`
+          );
           if (threadTopic?.kind === 'project') {
             this.syncForumWorkspaceForThread(message.messageThreadId);
           }
@@ -3429,6 +3492,9 @@ class Bridge {
 
         if (message.text && message.text.trim().startsWith('/')) {
           this.logCliEvent('Telegram command', message.text);
+          this.logger.info(
+            `Incoming Telegram command in thread ${message.messageThreadId ?? '-'}: ${message.text.trim()}`
+          );
         }
 
         if (message.fileId) {

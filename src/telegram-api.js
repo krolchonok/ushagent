@@ -395,7 +395,7 @@ class TelegramApi {
         }
       }
 
-      return { messages, nextCursor };
+      return { messages, nextCursor, rawUpdates: updates };
     } catch (error) {
       throw toTelegramError(error, 'Failed to poll Telegram updates');
     }

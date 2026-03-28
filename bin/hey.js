@@ -14,7 +14,39 @@ import { getServiceDefinition, getUserServiceStatus, installUserService, removeU
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 loadUshAgentEnv({ cwd: process.cwd() });
-const args = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+
+function applyConsoleLogFlag(argv) {
+  const cleaned = [];
+  let consoleLogs = null;
+
+  for (const value of argv) {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+      continue;
+    }
+
+    if (normalized === '--console-logs') {
+      consoleLogs = true;
+      continue;
+    }
+
+    if (normalized === '--no-console-logs') {
+      consoleLogs = false;
+      continue;
+    }
+
+    cleaned.push(value);
+  }
+
+  if (consoleLogs !== null) {
+    process.env.USHAGENT_CONSOLE_LOGS = consoleLogs ? '1' : '0';
+  }
+
+  return cleaned;
+}
+
+const args = applyConsoleLogFlag(rawArgs);
 const command = args[0];
 const logger = new Logger('ushagent');
 
@@ -33,7 +65,7 @@ function showHelp() {
 UshAgent: Telegram bridge for Codex.
 
 Usage:
-  ushagent codex [provider-args...] [--new] [--session <session-id>]
+  ushagent [--console-logs|--no-console-logs] codex [provider-args...] [--new] [--session <session-id>]
   ushagent status
   ushagent service <install|status|start|stop|restart|remove>
   ushagent reset              Reset Telegram setup (bot token + chat pairing)
@@ -44,6 +76,7 @@ Usage:
 
 Examples:
   ushagent codex                       (resumes latest session)
+  ushagent --console-logs codex        (also print internal logs to console)
   ushagent codex --new                 (creates new session)
   ushagent codex --model gpt-5-codex
   ushagent service install             (install background service for this project)
@@ -52,6 +85,7 @@ Examples:
 Token sources:
   .env -> process.env -> ~/.ushagent/config.json
   Supported env vars: USHAGENT_TELEGRAM_BOT_TOKEN, HEYAGENT_TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_TOKEN
+  Console log env vars: USHAGENT_CONSOLE_LOGS, HEYAGENT_CONSOLE_LOGS
 
 See more: https://ushagent.dev
 `);
