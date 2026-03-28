@@ -63,8 +63,7 @@ export function collectKnownWorkspaces(config, options = {}) {
 
     const current = workspaceMap.get(normalizedPath) || asWorkspaceRecord(normalizedPath);
     const sessionCount = current.sessionCount + 1;
-    const lastUsedAt =
-      !current.lastUsedAt || session.timestamp > current.lastUsedAt ? session.timestamp : current.lastUsedAt;
+    const lastUsedAt = !current.lastUsedAt || session.timestamp > current.lastUsedAt ? session.timestamp : current.lastUsedAt;
 
     workspaceMap.set(
       normalizedPath,

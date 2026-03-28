@@ -146,6 +146,7 @@ When running in an interactive terminal, UshAgent also accepts live local input.
 - `/project <number|path|current>` switch or inspect active project
 
 Local CLI is command-only. Send prompts to Codex from Telegram.
+
 - `/sessions` show sessions for the current project
 - `/session` show current session binding and next prompt mode
 - `/status` print local bridge status

@@ -1,6 +1,8 @@
 import TelegramBot from 'node-telegram-bot-api';
 
 const MAX_MESSAGE_CHUNK_SIZE = 3800;
+const DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS = 15_000;
+const TELEGRAM_DOWNLOAD_TIMEOUT_MS = 60_000;
 
 function normalizeText(value) {
   const text = String(value ?? '')
@@ -100,6 +102,28 @@ class TelegramApiError extends Error {
     super(message);
     this.name = 'TelegramApiError';
     this.status = status;
+  }
+}
+
+function createTimeoutError(timeoutMs, actionLabel = 'Telegram request') {
+  return new TelegramApiError(`${actionLabel} timed out after ${Math.ceil(timeoutMs / 1000)}s`, 408);
+}
+
+async function withTimeout(promise, timeoutMs, actionLabel) {
+  const normalizedTimeout = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS;
+
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve(promise),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(createTimeoutError(normalizedTimeout, actionLabel)), normalizedTimeout);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -259,7 +283,7 @@ class TelegramApi {
 
   async getMe() {
     try {
-      return await this.bot.getMe();
+      return await withTimeout(this.bot.getMe(), DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS, 'Telegram token validation');
     } catch (error) {
       throw toTelegramError(error, 'Failed to validate Telegram bot token');
     }
@@ -267,9 +291,13 @@ class TelegramApi {
 
   async ensurePollingMode() {
     try {
-      await this.bot.deleteWebHook({
-        drop_pending_updates: false,
-      });
+      await withTimeout(
+        this.bot.deleteWebHook({
+          drop_pending_updates: false,
+        }),
+        DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS,
+        'Telegram polling mode switch'
+      );
     } catch (error) {
       throw toTelegramError(error, 'Failed to switch Telegram bot to polling mode');
     }
@@ -286,7 +314,7 @@ class TelegramApi {
       : [];
 
     try {
-      await this.bot.setMyCommands(normalizedCommands);
+      await withTimeout(this.bot.setMyCommands(normalizedCommands), DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS, 'Telegram bot command registration');
     } catch (error) {
       throw toTelegramError(error, 'Failed to register Telegram bot commands');
     }
@@ -299,7 +327,7 @@ class TelegramApi {
     }
 
     try {
-      return await this.bot.getChat(targetChatId);
+      return await withTimeout(this.bot.getChat(targetChatId), DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS, 'Telegram chat lookup');
     } catch (error) {
       throw toTelegramError(error, 'Failed to fetch Telegram chat info');
     }
@@ -324,7 +352,11 @@ class TelegramApi {
     }
 
     try {
-      return await this.bot.createForumTopic(targetChatId, normalizedName, form);
+      return await withTimeout(
+        this.bot.createForumTopic(targetChatId, normalizedName, form),
+        DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS,
+        'Telegram forum topic creation'
+      );
     } catch (error) {
       throw toTelegramError(error, 'Failed to create Telegram forum topic');
     }
@@ -341,7 +373,8 @@ class TelegramApi {
     }
 
     try {
-      const updates = await this.bot.getUpdates(opts);
+      const requestTimeoutMs = Math.max(DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS, opts.timeout * 1000 + 10_000);
+      const updates = await withTimeout(this.bot.getUpdates(opts), requestTimeoutMs, 'Telegram update polling');
       let nextCursor = Number.isFinite(cursor) ? cursor : 0;
       const messages = [];
 
@@ -391,7 +424,11 @@ class TelegramApi {
         if (index === chunks.length - 1 && options.replyMarkup) {
           requestOptions.reply_markup = options.replyMarkup;
         }
-        lastMessage = await this.bot.sendMessage(targetChatId, formatTelegramHtml(chunk), requestOptions);
+        lastMessage = await withTimeout(
+          this.bot.sendMessage(targetChatId, formatTelegramHtml(chunk), requestOptions),
+          DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS,
+          'Telegram message send'
+        );
       }
       return lastMessage;
     } catch (error) {
@@ -406,7 +443,11 @@ class TelegramApi {
     }
 
     try {
-      await this.bot.answerCallbackQuery(normalizedId, text ? { text } : {});
+      await withTimeout(
+        this.bot.answerCallbackQuery(normalizedId, text ? { text } : {}),
+        DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS,
+        'Telegram callback reply'
+      );
     } catch (error) {
       throw toTelegramError(error, 'Failed to answer Telegram callback query');
     }
@@ -423,12 +464,16 @@ class TelegramApi {
     }
 
     try {
-      return await this.bot.editMessageText(formatTelegramHtml(text), {
-        chat_id: targetChatId,
-        message_id: messageId,
-        parse_mode: 'HTML',
-        reply_markup: options.replyMarkup || undefined,
-      });
+      return await withTimeout(
+        this.bot.editMessageText(formatTelegramHtml(text), {
+          chat_id: targetChatId,
+          message_id: messageId,
+          parse_mode: 'HTML',
+          reply_markup: options.replyMarkup || undefined,
+        }),
+        DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS,
+        'Telegram message edit'
+      );
     } catch (error) {
       const message = String(error?.message || '');
       if (/message is not modified/i.test(message)) {
@@ -450,7 +495,7 @@ class TelegramApi {
     }
 
     try {
-      return await this.bot.downloadFile(normalizedFileId, targetDir);
+      return await withTimeout(this.bot.downloadFile(normalizedFileId, targetDir), TELEGRAM_DOWNLOAD_TIMEOUT_MS, 'Telegram file download');
     } catch (error) {
       throw toTelegramError(error, 'Failed to download Telegram file');
     }

@@ -9,12 +9,8 @@ import Logger from '../src/logger.js';
 import { applyDefaultBypassArgs, sanitizeProviderArgs } from '../src/args.js';
 import { loadUshAgentEnv } from '../src/env.js';
 import { applyClientBootstrapBundle, createClientBootstrapBundle } from '../src/client-bootstrap.js';
-import {
-  getServiceDefinition,
-  getUserServiceStatus,
-  installUserService,
-  removeUserService,
-} from '../src/service-manager.js';
+import { parseClientBootstrapBundle } from '../src/client-bootstrap.js';
+import { getServiceDefinition, getUserServiceStatus, installUserService, removeUserService } from '../src/service-manager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 loadUshAgentEnv({ cwd: process.cwd() });
@@ -183,7 +179,10 @@ function showStatus(config) {
 
 function parseServiceCommand(serviceArgs) {
   const args = Array.isArray(serviceArgs) ? [...serviceArgs] : [];
-  const action = String(args[0] || 'status').trim().toLowerCase() || 'status';
+  const action =
+    String(args[0] || 'status')
+      .trim()
+      .toLowerCase() || 'status';
   const flags = new Set();
 
   for (let index = 1; index < args.length; index += 1) {
@@ -422,6 +421,8 @@ async function main() {
     if (!bundle) {
       throw new Error('Missing required --bundle value.');
     }
+
+    parseClientBootstrapBundle(bundle);
 
     let botToken = getFlagValue('--token', args);
     if (!botToken) {

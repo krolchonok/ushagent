@@ -14,14 +14,7 @@ test('buildCodexArgs uses positional prompt for resume mode', () => {
     extraArgs: ['--dangerously-bypass-approvals-and-sandbox'],
   });
 
-  assert.deepEqual(args, [
-    'exec',
-    '--dangerously-bypass-approvals-and-sandbox',
-    'resume',
-    '--json',
-    'session-123',
-    '-',
-  ]);
+  assert.deepEqual(args, ['exec', '--dangerously-bypass-approvals-and-sandbox', 'resume', '--json', 'session-123', '-']);
 });
 
 test('buildCodexArgs uses stdin token for new exec mode', () => {
@@ -54,9 +47,7 @@ test('parseCodexProgressEvent extracts commentary progress and session ids', () 
 });
 
 test('parseCodexProgressEvent extracts commentary from item.completed agent messages', () => {
-  const progress = parseCodexProgressEvent(
-    '{"type":"item.completed","item":{"type":"agent_message","text":"Inspecting live events"}}'
-  );
+  const progress = parseCodexProgressEvent('{"type":"item.completed","item":{"type":"agent_message","text":"Inspecting live events"}}');
 
   assert.deepEqual(progress, {
     kind: 'progress',
@@ -66,9 +57,7 @@ test('parseCodexProgressEvent extracts commentary from item.completed agent mess
 });
 
 test('parseCodexProgressEvent extracts tool previews from item.started command execution events', () => {
-  const tool = parseCodexProgressEvent(
-    '{"type":"item.started","item":{"type":"command_execution","command":"pwsh -Command \\"Get-Process\\""}}'
-  );
+  const tool = parseCodexProgressEvent('{"type":"item.started","item":{"type":"command_execution","command":"pwsh -Command \\"Get-Process\\""}}');
 
   assert.deepEqual(tool, {
     kind: 'tool',

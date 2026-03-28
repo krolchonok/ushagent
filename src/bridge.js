@@ -66,11 +66,17 @@ function sanitizeTopicSegment(value, fallback = 'unknown') {
 }
 
 function getHostTopicKey(hostname = os.hostname()) {
-  return `host:${String(hostname || '').trim().toLowerCase()}`;
+  return `host:${String(hostname || '')
+    .trim()
+    .toLowerCase()}`;
 }
 
 function getProjectTopicKey(workspacePath, hostname = os.hostname()) {
-  return `project:${String(hostname || '').trim().toLowerCase()}:${String(workspacePath || '').trim().toLowerCase()}`;
+  return `project:${String(hostname || '')
+    .trim()
+    .toLowerCase()}:${String(workspacePath || '')
+    .trim()
+    .toLowerCase()}`;
 }
 
 function buildHostTopicTitle(hostname = os.hostname()) {
@@ -191,9 +197,7 @@ function trimProgressEntry(text) {
     return '';
   }
 
-  return normalized.length <= TELEGRAM_PROGRESS_ENTRY_MAX_CHARS
-    ? normalized
-    : `${normalized.slice(0, TELEGRAM_PROGRESS_ENTRY_MAX_CHARS - 1)}…`;
+  return normalized.length <= TELEGRAM_PROGRESS_ENTRY_MAX_CHARS ? normalized : `${normalized.slice(0, TELEGRAM_PROGRESS_ENTRY_MAX_CHARS - 1)}…`;
 }
 
 function buildTelegramProgressText(providerLabel, entries = []) {
@@ -215,10 +219,7 @@ function stripProgressPhasePrefix(text) {
 }
 
 function normalizeProgressComparison(text) {
-  return stripProgressPhasePrefix(text)
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
+  return stripProgressPhasePrefix(text).toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
 function isDuplicateOfFinalResponse(progressEntry, responseText) {
@@ -228,21 +229,39 @@ function isDuplicateOfFinalResponse(progressEntry, responseText) {
     return false;
   }
 
-  return (
-    progressText === responseNormalized ||
-    responseNormalized.startsWith(progressText) ||
-    progressText.startsWith(responseNormalized)
-  );
+  return progressText === responseNormalized || responseNormalized.startsWith(progressText) || progressText.startsWith(responseNormalized);
 }
 
 function normalizeTelegramCommand(rawCommand) {
-  const value = String(rawCommand || '').trim().toLowerCase();
+  const value = String(rawCommand || '')
+    .trim()
+    .toLowerCase();
   if (!value.startsWith('/')) {
     return value;
   }
 
   const mentionIndex = value.indexOf('@');
   return mentionIndex > 0 ? value.slice(0, mentionIndex) : value;
+}
+
+function isTelegramCommandForBot(rawCommand, botUsername) {
+  const value = String(rawCommand || '')
+    .trim()
+    .toLowerCase();
+  if (!value.startsWith('/')) {
+    return false;
+  }
+
+  const mentionIndex = value.indexOf('@');
+  if (mentionIndex <= 0) {
+    return true;
+  }
+
+  const mentionedBot = value.slice(mentionIndex + 1).trim();
+  const normalizedBotUsername = String(botUsername || '')
+    .trim()
+    .toLowerCase();
+  return Boolean(mentionedBot && normalizedBotUsername && mentionedBot === normalizedBotUsername);
 }
 
 function formatHistoryTimestamp(value) {
@@ -347,10 +366,7 @@ class Bridge {
         silent: true,
       });
       if (Number.isInteger(startupMessage?.message_id)) {
-        this.config.setTelegramControlPanelMessageId(
-          this.getControlPanelSlotKey(this.getActiveTelegramThreadId()),
-          startupMessage.message_id
-        );
+        this.config.setTelegramControlPanelMessageId(this.getControlPanelSlotKey(this.getActiveTelegramThreadId()), startupMessage.message_id);
       }
 
       this.startLocalInputLoop();
@@ -419,8 +435,12 @@ class Bridge {
       return true;
     }
 
-    const topicHostname = String(topic.hostname || '').trim().toLowerCase();
-    const currentHostname = String(os.hostname() || '').trim().toLowerCase();
+    const topicHostname = String(topic.hostname || '')
+      .trim()
+      .toLowerCase();
+    const currentHostname = String(os.hostname() || '')
+      .trim()
+      .toLowerCase();
     return Boolean(topicHostname) && topicHostname === currentHostname;
   }
 
@@ -437,12 +457,19 @@ class Bridge {
         ...topic,
       }));
 
-    const hostname = String(options.hostname || '').trim().toLowerCase();
+    const hostname = String(options.hostname || '')
+      .trim()
+      .toLowerCase();
     if (!hostname) {
       return topics;
     }
 
-    return topics.filter(topic => String(topic.hostname || '').trim().toLowerCase() === hostname);
+    return topics.filter(
+      topic =>
+        String(topic.hostname || '')
+          .trim()
+          .toLowerCase() === hostname
+    );
   }
 
   async ensureTelegramForumContext(chatId) {
@@ -1079,14 +1106,7 @@ class Bridge {
     }
 
     const sourceLabel = this.lastExchange.source === 'cli' ? 'CLI' : 'Telegram';
-    return [
-      `Source: ${sourceLabel}`,
-      `Request:`,
-      this.lastExchange.prompt,
-      '',
-      `Response:`,
-      this.lastExchange.response,
-    ].join('\n');
+    return [`Source: ${sourceLabel}`, `Request:`, this.lastExchange.prompt, '', `Response:`, this.lastExchange.response].join('\n');
   }
 
   recordConversationEntry(entry = {}) {
@@ -1150,11 +1170,7 @@ class Bridge {
     }
 
     const who = previous.role === 'user' ? 'User' : 'Codex';
-    return [
-      `Latest message in Codex session ${sessionId}:`,
-      `[${formatHistoryTimestamp(previous.timestamp)}] ${who}`,
-      previous.text,
-    ].join('\n');
+    return [`Latest message in Codex session ${sessionId}:`, `[${formatHistoryTimestamp(previous.timestamp)}] ${who}`, previous.text].join('\n');
   }
 
   async getUsageSnapshot(options = {}) {
@@ -1527,7 +1543,9 @@ class Bridge {
         await this.telegram.answerCallbackQuery(callbackQueryId);
         const hostTopic = this.findForumTopicByThreadId(messageThreadId);
         const hostname =
-          this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.hostThreadId ? hostTopic?.hostname || os.hostname() : os.hostname();
+          this.telegramForumState?.enabled && messageThreadId === this.telegramForumState.hostThreadId
+            ? hostTopic?.hostname || os.hostname()
+            : os.hostname();
         await this.publishTelegramView(this.buildForumWorkspaceBrowserText({ hostname }), {
           messageId,
           messageThreadId,
@@ -1765,13 +1783,7 @@ class Bridge {
         }
 
         await this.publishTelegramView(
-          buildStatusText(
-            this.config,
-            this.provider,
-            this.providerArgs,
-            this.sleepInhibitorState,
-            this.attachmentHandler?.getStatusText?.() || null
-          ),
+          buildStatusText(this.config, this.provider, this.providerArgs, this.sleepInhibitorState, this.attachmentHandler?.getStatusText?.() || null),
           {
             messageId,
             messageThreadId,
@@ -2220,13 +2232,7 @@ class Bridge {
 
     if (line === '/status') {
       this.writeCliLine(
-        buildStatusText(
-          this.config,
-          this.provider,
-          this.providerArgs,
-          this.sleepInhibitorState,
-          this.attachmentHandler?.getStatusText?.() || null
-        )
+        buildStatusText(this.config, this.provider, this.providerArgs, this.sleepInhibitorState, this.attachmentHandler?.getStatusText?.() || null)
       );
       return;
     }
@@ -2617,7 +2623,9 @@ class Bridge {
   buildSessionStatusText() {
     const boundSessionId = this.getBoundSessionId();
     const lastSessionId = this.getLastSessionId();
-    const nextAction = this.forceNewNextPrompt ? `new ${formatProviderName(this.provider)} session` : `resume ${this.describeResumeTarget(boundSessionId)}`;
+    const nextAction = this.forceNewNextPrompt
+      ? `new ${formatProviderName(this.provider)} session`
+      : `resume ${this.describeResumeTarget(boundSessionId)}`;
 
     return [
       `Workspace: ${this.getCurrentWorkspacePath()}`,
@@ -2692,9 +2700,7 @@ class Bridge {
     }
 
     const before = this.telegramPendingMessages.length;
-    this.telegramPendingMessages = this.telegramPendingMessages.filter(
-      entry => this.getPendingExecutionKey(entry) !== targetExecutionKey
-    );
+    this.telegramPendingMessages = this.telegramPendingMessages.filter(entry => this.getPendingExecutionKey(entry) !== targetExecutionKey);
     const removed = before - this.telegramPendingMessages.length;
     if (this.telegramPendingMessages.length > 0) {
       this.startTelegramDispatch(true);
@@ -2772,11 +2778,7 @@ class Bridge {
     const provider = String(record?.provider || this.provider).trim() || this.provider;
     const providerArgs = Array.isArray(record?.codexArgs) ? [...record.codexArgs] : [...this.providerArgs];
     const sourceThreadId =
-      source === 'telegram'
-        ? Number.isInteger(options.messageThreadId)
-          ? options.messageThreadId
-          : this.getActiveTelegramThreadId()
-        : null;
+      source === 'telegram' ? (Number.isInteger(options.messageThreadId) ? options.messageThreadId : this.getActiveTelegramThreadId()) : null;
     const topicSessionState = this.getForumTopicSessionState(sourceThreadId, provider);
     const sessionMode =
       topicSessionState?.sessionMode ||
@@ -3085,11 +3087,7 @@ class Bridge {
             lastProgressText = normalized;
             const phaseSuffix = String(progressEvent?.phase || '').trim();
             this.logCliEvent(phaseSuffix ? `${providerLabel} progress [${phaseSuffix}]` : `${providerLabel} progress`, normalized);
-            this.logger.info(
-              phaseSuffix
-                ? `${providerLabel} progress [${phaseSuffix}]: ${normalized}`
-                : `${providerLabel} progress: ${normalized}`
-            );
+            this.logger.info(phaseSuffix ? `${providerLabel} progress [${phaseSuffix}]: ${normalized}` : `${providerLabel} progress: ${normalized}`);
 
             if (source !== 'telegram') {
               return;
@@ -3270,6 +3268,10 @@ class Bridge {
             continue;
           }
 
+          if (!isTelegramCommandForBot(normalizedText.split(/\s+/)[0] || '', botUsername)) {
+            continue;
+          }
+
           const forumChat = await this.telegram.getChat(message.chatId);
           if (forumChat?.is_forum !== true) {
             continue;
@@ -3403,10 +3405,7 @@ class Bridge {
   }
 
   async handleMessage(messageOrText) {
-    const message =
-      messageOrText && typeof messageOrText === 'object'
-        ? messageOrText
-        : { text: messageOrText };
+    const message = messageOrText && typeof messageOrText === 'object' ? messageOrText : { text: messageOrText };
     const text = String(message?.text || '').trim();
     if (!text) {
       return;
@@ -3425,8 +3424,7 @@ class Bridge {
 
     await this.enqueueTelegramPrompt(text, {
       messageThreadId: Number.isInteger(message?.messageThreadId) ? message.messageThreadId : null,
-      workspacePath:
-        this.findForumTopicByThreadId(message?.messageThreadId)?.workspacePath || this.getCurrentWorkspacePath(),
+      workspacePath: this.findForumTopicByThreadId(message?.messageThreadId)?.workspacePath || this.getCurrentWorkspacePath(),
     });
   }
 
@@ -3436,7 +3434,12 @@ class Bridge {
       return;
     }
 
-    const command = normalizeTelegramCommand(text.split(/\s+/)[0] || '');
+    const commandToken = text.split(/\s+/)[0] || '';
+    if (!isTelegramCommandForBot(commandToken, this.config.telegramBotUsername)) {
+      return;
+    }
+
+    const command = normalizeTelegramCommand(commandToken);
     if (command === '/usage') {
       await this.publishTelegramView(await this.buildUsageText({ force: true }), {
         messageThreadId: this.telegramForumState?.mainThreadId ?? null,
@@ -3475,7 +3478,12 @@ class Bridge {
       return;
     }
 
-    const command = normalizeTelegramCommand(text.split(/\s+/)[0] || '');
+    const commandToken = text.split(/\s+/)[0] || '';
+    if (!isTelegramCommandForBot(commandToken, this.config.telegramBotUsername)) {
+      return;
+    }
+
+    const command = normalizeTelegramCommand(commandToken);
     const hostTopic = this.findForumTopicByThreadId(message.messageThreadId);
 
     if (command === '/usage') {
@@ -3538,8 +3546,7 @@ class Bridge {
       const prepared = await this.attachmentHandler.createPrompt(message);
       await this.enqueueTelegramPrompt(prepared.prompt, {
         messageThreadId: Number.isInteger(message?.messageThreadId) ? message.messageThreadId : null,
-        workspacePath:
-          this.findForumTopicByThreadId(message?.messageThreadId)?.workspacePath || this.getCurrentWorkspacePath(),
+        workspacePath: this.findForumTopicByThreadId(message?.messageThreadId)?.workspacePath || this.getCurrentWorkspacePath(),
       });
     } catch (error) {
       const messageText = error?.message ? String(error.message) : String(error);
@@ -3553,7 +3560,12 @@ class Bridge {
       .trim()
       .split(/\s+/)
       .filter(Boolean);
-    const command = normalizeTelegramCommand(parts[0] || '');
+    const commandToken = parts[0] || '';
+    if (!isTelegramCommandForBot(commandToken, this.config.telegramBotUsername)) {
+      return;
+    }
+
+    const command = normalizeTelegramCommand(commandToken);
     const argument = parts.slice(1).join(' ').trim();
 
     if (command === '/help') {
@@ -3671,13 +3683,7 @@ class Bridge {
 
     if (command === '/status') {
       await this.publishTelegramView(
-        buildStatusText(
-          this.config,
-          this.provider,
-          this.providerArgs,
-          this.sleepInhibitorState,
-          this.attachmentHandler?.getStatusText?.() || null
-        ),
+        buildStatusText(this.config, this.provider, this.providerArgs, this.sleepInhibitorState, this.attachmentHandler?.getStatusText?.() || null),
         {
           replyMarkup: this.buildControlKeyboard(),
           persistMenu: true,

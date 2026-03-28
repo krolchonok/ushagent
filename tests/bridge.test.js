@@ -70,10 +70,7 @@ class FakeConfig {
     this._data.telegramForum = {
       ...this._data.telegramForum,
       ...data,
-      topics:
-        data.topics && typeof data.topics === 'object' && !Array.isArray(data.topics)
-          ? { ...data.topics }
-          : this._data.telegramForum.topics,
+      topics: data.topics && typeof data.topics === 'object' && !Array.isArray(data.topics) ? { ...data.topics } : this._data.telegramForum.topics,
     };
     return this._data;
   }
@@ -1420,9 +1417,29 @@ test('handleCommand accepts Telegram commands with bot mention suffix', async ()
       opened = true;
     };
 
-    await bridge.handleCommand('/menu@botname');
+    await bridge.handleCommand('/menu@bot');
 
     assert.equal(opened, true);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('handleCommand ignores Telegram commands addressed to another bot', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    let opened = false;
+    bridge.openControlPanel = async () => {
+      opened = true;
+    };
+
+    await bridge.handleCommand('/menu@otherbot');
+
+    assert.equal(opened, false);
   } finally {
     process.chdir(previousCwd);
   }
@@ -1542,6 +1559,101 @@ test('runPairingFlow supports forum pairing from a supergroup topic chat', async
   }
 });
 
+test('runPairingFlow ignores forum commands addressed to another bot', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    bridge.running = true;
+    config.setMany({
+      telegramUpdateCursor: 0,
+      telegramBotUsername: 'forumbot',
+      telegramChatId: null,
+      telegramChatUserId: null,
+    });
+
+    let updateCall = 0;
+    bridge.telegram = {
+      getUpdates: async () => {
+        updateCall += 1;
+        if (updateCall === 1) {
+          return {
+            nextCursor: 1,
+            messages: [
+              {
+                chatId: '-1001',
+                chatType: 'supergroup',
+                userId: 'user-1',
+                text: '/help@otherbot',
+              },
+            ],
+          };
+        }
+
+        return {
+          nextCursor: 2,
+          messages: [
+            {
+              chatId: '-1001',
+              chatType: 'supergroup',
+              userId: 'user-1',
+              text: '/help@forumbot',
+            },
+          ],
+        };
+      },
+      getChat: async chatId => ({
+        id: chatId,
+        is_forum: true,
+      }),
+      sendMessage: async () => null,
+    };
+
+    const pairing = await bridge.runPairingFlow({
+      mode: 'manual',
+      chatMode: 'forum',
+    });
+
+    assert.equal(pairing.chatId, '-1001');
+    assert.equal(updateCall, 2);
+    assert.equal(config.telegramChatId, '-1001');
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('handleHostTopicMessage ignores Telegram commands addressed to another bot', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    bridge.telegramForumState = {
+      enabled: true,
+      hostThreadId: 77,
+      mainThreadId: 10,
+      topicsByThreadId: new Map(),
+    };
+
+    let published = false;
+    bridge.publishTelegramView = async () => {
+      published = true;
+    };
+
+    await bridge.handleHostTopicMessage({
+      text: '/help@otherbot',
+      messageThreadId: 77,
+    });
+
+    assert.equal(published, false);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('handleCommand /history returns recent chat history', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
@@ -1617,7 +1729,23 @@ test('connectToken registers Telegram bot commands during initialization', async
     assert.ok(Array.isArray(registeredCommands));
     assert.deepEqual(
       registeredCommands.map(command => command.command),
-      ['help', 'keyboard', 'menu', 'status', 'new', 'session', 'sessions', 'resume', 'project', 'projects', 'usage', 'history', 'prev', 'last', 'stop']
+      [
+        'help',
+        'keyboard',
+        'menu',
+        'status',
+        'new',
+        'session',
+        'sessions',
+        'resume',
+        'project',
+        'projects',
+        'usage',
+        'history',
+        'prev',
+        'last',
+        'stop',
+      ]
     );
     assert.equal(config.telegramBotUsername, 'freshbot');
   } finally {

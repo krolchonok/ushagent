@@ -55,17 +55,20 @@ test('listCodexSessions includes a preview of the latest transcript message', ()
 });
 
 test('formatCodexSessionList renders session preview on its own line', () => {
-  const text = formatCodexSessionList([
+  const text = formatCodexSessionList(
+    [
+      {
+        id: 'session-preview',
+        timestamp: '2099-11-30T12:00:00.000Z',
+        cwd: '/tmp/codex-session-preview',
+        model: null,
+        preview: 'User: status',
+      },
+    ],
     {
-      id: 'session-preview',
-      timestamp: '2099-11-30T12:00:00.000Z',
       cwd: '/tmp/codex-session-preview',
-      model: null,
-      preview: 'User: status',
-    },
-  ], {
-    cwd: '/tmp/codex-session-preview',
-  });
+    }
+  );
 
   assert.match(text, /1\. session-preview/);
   assert.match(text, /User: status/);

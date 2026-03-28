@@ -3,13 +3,7 @@ import test from 'node:test';
 import { TelegramApi, formatTelegramHtml } from '../src/telegram-api.js';
 
 test('formatTelegramHtml converts inline and fenced code to Telegram HTML', () => {
-  const formatted = formatTelegramHtml([
-    'Use `npm install` first.',
-    '',
-    '```js',
-    'console.log("ok");',
-    '```',
-  ].join('\n'));
+  const formatted = formatTelegramHtml(['Use `npm install` first.', '', '```js', 'console.log("ok");', '```'].join('\n'));
 
   assert.match(formatted, /Use <code>npm install<\/code> first\./);
   assert.match(formatted, /<pre><code class="language-js">console\.log\("ok"\);\n<\/code><\/pre>/);
@@ -129,4 +123,18 @@ test('editMessageText does not send message thread id to Telegram', async () => 
   assert.deepEqual(request.options.reply_markup, {
     inline_keyboard: [[{ text: 'OK', callback_data: 'ok' }]],
   });
+});
+
+test('getMe fails fast when Telegram API does not respond', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  api.bot = {
+    getMe: () => new Promise(() => {}),
+  };
+
+  const start = Date.now();
+  await assert.rejects(() => api.getMe(), /timed out after 15s/);
+  const elapsedMs = Date.now() - start;
+
+  assert.ok(elapsedMs >= 14_000, `expected timeout near 15s, got ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 17_000, `timeout took too long: ${elapsedMs}ms`);
 });

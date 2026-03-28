@@ -180,8 +180,7 @@ class Config {
 
   get telegramForum() {
     const value = this._data.telegramForum ?? this.defaults.telegramForum;
-    const topics =
-      value?.topics && typeof value.topics === 'object' && !Array.isArray(value.topics) ? { ...value.topics } : {};
+    const topics = value?.topics && typeof value.topics === 'object' && !Array.isArray(value.topics) ? { ...value.topics } : {};
     return {
       enabled: value?.enabled === true,
       chatId: value?.chatId ?? null,
@@ -248,8 +247,8 @@ class Config {
 
     this.save({
       telegramBotToken: keepBotToken ? this.getStoredTelegramBotToken() : null,
-      telegramBotUsername: keepBotToken ? this._data.telegramBotUsername ?? this.defaults.telegramBotUsername : null,
-      telegramBotId: keepBotToken ? this._data.telegramBotId ?? this.defaults.telegramBotId : null,
+      telegramBotUsername: keepBotToken ? (this._data.telegramBotUsername ?? this.defaults.telegramBotUsername) : null,
+      telegramBotId: keepBotToken ? (this._data.telegramBotId ?? this.defaults.telegramBotId) : null,
       telegramChatId: null,
       telegramChatUserId: null,
       telegramControlPanelMessageId: null,
@@ -302,10 +301,7 @@ class Config {
     const next = {
       ...current,
       ...data,
-      topics:
-        data.topics && typeof data.topics === 'object' && !Array.isArray(data.topics)
-          ? { ...data.topics }
-          : current.topics,
+      topics: data.topics && typeof data.topics === 'object' && !Array.isArray(data.topics) ? { ...data.topics } : current.topics,
     };
 
     return this.save({

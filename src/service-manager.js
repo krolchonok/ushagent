@@ -27,11 +27,13 @@ function runCommand(command, args, options = {}) {
 }
 
 function sanitizeSegment(value) {
-  return String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'project';
+  return (
+    String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'project'
+  );
 }
 
 function quoteSystemdArg(value) {
@@ -107,14 +109,7 @@ function buildServiceUnit(definition) {
     lines.push(`Environment=USHAGENT_ENV_FILE="${systemdEscapeEnvValue(envPath)}"`);
   }
 
-  lines.push(
-    'Restart=always',
-    'RestartSec=5',
-    '',
-    '[Install]',
-    'WantedBy=default.target',
-    ''
-  );
+  lines.push('Restart=always', 'RestartSec=5', '', '[Install]', 'WantedBy=default.target', '');
 
   return lines.join('\n');
 }
@@ -211,10 +206,4 @@ function getUserServiceStatus(options = {}) {
   };
 }
 
-export {
-  buildServiceUnit,
-  getServiceDefinition,
-  getUserServiceStatus,
-  installUserService,
-  removeUserService,
-};
+export { buildServiceUnit, getServiceDefinition, getUserServiceStatus, installUserService, removeUserService };

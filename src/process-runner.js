@@ -29,8 +29,7 @@ export function resolveProcessSpawn(command, args = []) {
 }
 
 export function runProcess(command, args, options = {}) {
-  const timeoutMs =
-    options.timeoutMs === undefined || options.timeoutMs === null ? DEFAULT_TIMEOUT_MS : Math.max(0, Number(options.timeoutMs) || 0);
+  const timeoutMs = options.timeoutMs === undefined || options.timeoutMs === null ? DEFAULT_TIMEOUT_MS : Math.max(0, Number(options.timeoutMs) || 0);
   const cwd = options.cwd || process.cwd();
   const signal = options.signal || null;
   const input = options.input === undefined || options.input === null ? null : String(options.input);

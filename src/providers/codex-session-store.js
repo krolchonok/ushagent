@@ -242,10 +242,7 @@ export function getCodexSessionTranscript(options = {}) {
     };
   }
 
-  const entries = readJsonLines(session.filePath)
-    .map(parseTranscriptEntry)
-    .filter(Boolean)
-    .slice(-limit);
+  const entries = readJsonLines(session.filePath).map(parseTranscriptEntry).filter(Boolean).slice(-limit);
 
   return {
     session,

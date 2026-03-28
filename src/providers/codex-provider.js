@@ -8,7 +8,11 @@ export function getCodexCommand() {
 }
 
 export function parseCodexProgressEvent(line) {
-  if (!String(line || '').trim().startsWith('{')) {
+  if (
+    !String(line || '')
+      .trim()
+      .startsWith('{')
+  ) {
     return null;
   }
 
@@ -96,10 +100,7 @@ export function parseCodexProgressEvent(line) {
     if (
       progressText &&
       (Boolean(phase) ||
-        ((eventType.includes('delta') ||
-          eventType.includes('message') ||
-          eventType.includes('content') ||
-          eventType.includes('output')) &&
+        ((eventType.includes('delta') || eventType.includes('message') || eventType.includes('content') || eventType.includes('output')) &&
           isLikelyProgressMessage(progressText)))
     ) {
       return {
@@ -190,7 +191,9 @@ function extractFromContent(content, depth = 0) {
 }
 
 function toToolPreview(commandText) {
-  const normalized = String(commandText || '').trim().replace(/\s+/g, ' ');
+  const normalized = String(commandText || '')
+    .trim()
+    .replace(/\s+/g, ' ');
   if (!normalized) {
     return 'command';
   }
@@ -204,7 +207,10 @@ function isLikelyProgressMessage(text) {
     return false;
   }
 
-  const lines = normalized.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const lines = normalized
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
   if (lines.length > 4) {
     return false;
   }
@@ -371,7 +377,12 @@ export async function runCodexPrompt(prompt, options = {}) {
         stdoutBuffer = lines.pop() || '';
 
         for (const line of lines) {
-          if (onRawEvent && String(line || '').trim().startsWith('{')) {
+          if (
+            onRawEvent &&
+            String(line || '')
+              .trim()
+              .startsWith('{')
+          ) {
             onRawEvent(line);
           }
 
