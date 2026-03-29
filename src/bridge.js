@@ -40,8 +40,10 @@ const TELEGRAM_PROGRESS_HISTORY_LIMIT = 8;
 const TELEGRAM_PROGRESS_ENTRY_MAX_CHARS = 180;
 const TELEGRAM_PROGRESS_TEXT_MAX_CHARS = 3200;
 const TELEGRAM_RAW_UPDATE_LOG_MAX_CHARS = 2000;
+const CODEX_FAST_REASONING_LEVEL = 'low';
 const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: 'help', description: 'Show available commands' },
+  { command: 'fast', description: 'Enable fast Codex mode for next prompts' },
   { command: 'keyboard', description: 'Configure reply keyboard buttons' },
   { command: 'menu', description: 'Open the control panel' },
   { command: 'status', description: 'Show current bridge status' },
@@ -125,6 +127,7 @@ function buildStatusText(config, provider, providerArgs = [], sleepInhibitorStat
   const sleepStatus = formatSleepInhibitorStatus(sleepInhibitorState);
   return [
     `Provider: ${provider}`,
+    provider === 'codex' ? `Fast mode: ${isCodexFastModeEnabled(providerArgs) ? 'on' : 'off'}` : null,
     `Args: ${argsText}`,
     `Sleep prevention: ${sleepStatus}`,
     attachmentStatus ? `Voice transcription: ${attachmentStatus}` : null,
@@ -201,9 +204,19 @@ function trimProgressEntry(text) {
   return normalized.length <= TELEGRAM_PROGRESS_ENTRY_MAX_CHARS ? normalized : `${normalized.slice(0, TELEGRAM_PROGRESS_ENTRY_MAX_CHARS - 1)}…`;
 }
 
-function buildTelegramProgressText(providerLabel, entries = []) {
+function formatProgressTimestamp(value = new Date()) {
+  return new Intl.DateTimeFormat('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(value);
+}
+
+function buildTelegramProgressText(providerLabel, entries = [], updatedAt = new Date()) {
   const body = entries.filter(Boolean).join('\n');
-  const combined = body ? `${providerLabel} is working...\n\n${body}` : `${providerLabel} is working...`;
+  const header = `${providerLabel} is working...\nUpdated: ${formatProgressTimestamp(updatedAt)}`;
+  const combined = body ? `${header}\n\n${body}` : header;
   if (combined.length <= TELEGRAM_PROGRESS_TEXT_MAX_CHARS) {
     return combined;
   }
@@ -215,6 +228,7 @@ function buildTelegramProgressText(providerLabel, entries = []) {
 function stripProgressPhasePrefix(text) {
   return String(text || '')
     .trim()
+    .replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '')
     .replace(/^\[[^\]]+\]\s*/, '')
     .trim();
 }
@@ -263,6 +277,67 @@ function isTelegramCommandForBot(rawCommand, botUsername) {
     .trim()
     .toLowerCase();
   return Boolean(mentionedBot && normalizedBotUsername && mentionedBot === normalizedBotUsername);
+}
+
+function normalizeCodexConfigValue(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function isCodexReasoningOverride(value) {
+  return /^(reasoning_effort|effort)\s*=/.test(String(value || '').trim().toLowerCase());
+}
+
+function isCodexFastModeEnabled(providerArgs = []) {
+  const args = Array.isArray(providerArgs) ? providerArgs : [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = String(args[index] || '').trim();
+    if ((value === '-c' || value === '--config') && isCodexReasoningOverride(args[index + 1])) {
+      const configValue = String(args[index + 1] || '').trim();
+      const [, assignedValue = ''] = configValue.split('=', 2);
+      return normalizeCodexConfigValue(assignedValue) === CODEX_FAST_REASONING_LEVEL;
+    }
+
+    if (value.startsWith('--config=') && isCodexReasoningOverride(value.slice('--config='.length))) {
+      const configValue = value.slice('--config='.length).trim();
+      const [, assignedValue = ''] = configValue.split('=', 2);
+      return normalizeCodexConfigValue(assignedValue) === CODEX_FAST_REASONING_LEVEL;
+    }
+  }
+
+  return false;
+}
+
+function setCodexFastMode(providerArgs = [], enabled) {
+  const args = Array.isArray(providerArgs) ? [...providerArgs] : [];
+  const nextArgs = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const value = String(args[index] || '').trim();
+    if (!value) {
+      continue;
+    }
+
+    if ((value === '-c' || value === '--config') && isCodexReasoningOverride(args[index + 1])) {
+      index += 1;
+      continue;
+    }
+
+    if (value.startsWith('--config=') && isCodexReasoningOverride(value.slice('--config='.length))) {
+      continue;
+    }
+
+    nextArgs.push(value);
+  }
+
+  if (enabled) {
+    nextArgs.push('-c', `reasoning_effort="${CODEX_FAST_REASONING_LEVEL}"`);
+  }
+
+  return nextArgs;
 }
 
 function isExplicitTelegramCommandForBot(rawCommand, botUsername) {
@@ -745,6 +820,57 @@ class Bridge {
       });
     }
     this.persistWorkspaceState();
+  }
+
+  isFastModeEnabled() {
+    return this.provider === 'codex' && isCodexFastModeEnabled(this.providerArgs);
+  }
+
+  setFastModeEnabled(enabled) {
+    if (this.provider !== 'codex') {
+      throw new Error('Fast mode is supported only for Codex.');
+    }
+
+    const normalizedEnabled = enabled === true;
+    const nextProviderArgs = setCodexFastMode(this.providerArgs, normalizedEnabled);
+    const effectiveArgs = applyDefaultBypassArgs(this.provider, nextProviderArgs).providerArgs;
+
+    this.providerArgs = effectiveArgs;
+    this.config.setMany({
+      provider: this.provider,
+      codexArgs: effectiveArgs,
+    });
+    this.persistWorkspaceState();
+  }
+
+  async handleFastModeCommand(argument = '', source = 'telegram') {
+    const normalizedArgument = String(argument || '').trim().toLowerCase();
+
+    if (normalizedArgument === 'status') {
+      const statusText = `Fast mode is ${this.isFastModeEnabled() ? 'on' : 'off'}.`;
+      if (source === 'cli') {
+        this.writeCliLine(statusText);
+      } else {
+        await this.safeSendMessage(statusText);
+      }
+      return;
+    }
+
+    const enable = !['off', '0', 'false', 'disable'].includes(normalizedArgument);
+    this.setFastModeEnabled(enable);
+
+    const argsText = this.providerArgs.join(' ');
+    const message = enable
+      ? `Fast mode enabled for the next Codex prompts.\nArgs: ${argsText}`
+      : `Fast mode disabled.\nArgs: ${argsText}`;
+
+    if (source === 'cli') {
+      this.writeCliLine(message);
+      await this.safeSendMessage(message, { from: 'CLI', silent: true });
+      return;
+    }
+
+    await this.safeSendMessage(message);
   }
 
   getCurrentWorkspacePath() {
@@ -2295,6 +2421,7 @@ class Bridge {
         [
           'Local CLI commands:',
           '/help - show this list',
+          '/fast [on|off|status] - toggle fast Codex mode for next prompts',
           '/menu - open or refresh control panel in Telegram',
           '/history [N] - show recent messages from current Codex session',
           '/prev - show the latest message from current Codex session',
@@ -2323,6 +2450,12 @@ class Bridge {
       this.writeCliLine(
         buildStatusText(this.config, this.provider, this.providerArgs, this.sleepInhibitorState, this.attachmentHandler?.getStatusText?.() || null)
       );
+      return;
+    }
+
+    if (line === '/fast' || line.startsWith('/fast ')) {
+      const argument = line.slice('/fast'.length).trim();
+      await this.handleFastModeCommand(argument, 'cli');
       return;
     }
 
@@ -3147,14 +3280,16 @@ class Bridge {
 
         if (source === 'telegram') {
           let progressMessageText = '';
+          const progressTimestamp = formatProgressTimestamp();
           if (groupedCount > 1) {
-            progressMessageText = `${providerLabel} is working on ${groupedCount} messages...`;
+            progressMessageText = `${providerLabel} is working on ${groupedCount} messages...\nStarted: ${progressTimestamp}`;
           } else {
-            progressMessageText = `${providerLabel} is working...`;
+            progressMessageText = `${providerLabel} is working...\nStarted: ${progressTimestamp}`;
           }
 
           const progressMessage = await this.safeSendMessage(progressMessageText, {
             messageThreadId: sourceThreadId,
+            silent: true,
           });
           if (Number.isInteger(progressMessage?.message_id)) {
             progressMessageId = progressMessage.message_id;
@@ -3182,7 +3317,10 @@ class Bridge {
               return;
             }
 
-            const nextEntry = trimProgressEntry(phaseSuffix ? `[${phaseSuffix}] ${normalized}` : normalized);
+            const timestampedEntry = phaseSuffix
+              ? `[${formatProgressTimestamp()}] [${phaseSuffix}] ${normalized}`
+              : `[${formatProgressTimestamp()}] ${normalized}`;
+            const nextEntry = trimProgressEntry(timestampedEntry);
             if (progressEntries.at(-1) !== nextEntry) {
               progressEntries = [...progressEntries, nextEntry].slice(-TELEGRAM_PROGRESS_HISTORY_LIMIT);
             }
@@ -3685,6 +3823,7 @@ class Bridge {
         [
           'UshAgent commands:',
           '/help - show command list',
+          '/fast [on|off|status] - toggle fast Codex mode for next prompts',
           '/keyboard - configure reply keyboard buttons',
           '/menu - open or refresh control panel',
           '/history [N] - show recent messages from current Codex session',
@@ -3714,6 +3853,11 @@ class Bridge {
     if (command === '/new') {
       this.resetSessionMode();
       await this.safeSendMessage('Session reset. Your next message starts fresh.');
+      return;
+    }
+
+    if (command === '/fast') {
+      await this.handleFastModeCommand(argument, 'telegram');
       return;
     }
 

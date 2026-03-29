@@ -60,6 +60,21 @@ test('sendMessage can disable notification delivery', async () => {
   assert.equal(request.options.disable_notification, true);
 });
 
+test('sendMessage disables web page previews for Telegram messages', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  let request = null;
+  api.bot = {
+    sendMessage: async (chatId, text, options) => {
+      request = { chatId, text, options };
+      return { message_id: 1 };
+    },
+  };
+
+  await api.sendMessage('chat-1', 'https://example.com');
+
+  assert.equal(request.options.disable_web_page_preview, true);
+});
+
 test('setMyCommands passes normalized commands to Telegram', async () => {
   const api = new TelegramApi('123456:token_token_token_token');
   let request = null;

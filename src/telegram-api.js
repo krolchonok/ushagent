@@ -414,6 +414,7 @@ class TelegramApi {
         const chunk = chunks[index];
         const requestOptions = {
           parse_mode: 'HTML',
+          disable_web_page_preview: true,
         };
         if (Number.isInteger(options.messageThreadId)) {
           requestOptions.message_thread_id = options.messageThreadId;

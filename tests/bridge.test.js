@@ -1022,6 +1022,7 @@ test('queuePrompt keeps Telegram replies in the original topic while active topi
     });
 
     assert.equal(sent[0].options.messageThreadId, 30);
+    assert.equal(sent[0].options.silent, true);
     assert.equal(edits[0].options.messageThreadId, 30);
     assert.equal(sent.at(-1).options.messageThreadId, 30);
   } finally {
@@ -1445,6 +1446,58 @@ test('handleCommand ignores Telegram commands addressed to another bot', async (
   }
 });
 
+test('handleCommand /fast enables fast Codex mode and persists provider args', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    let sentText = null;
+    bridge.safeSendMessage = async text => {
+      sentText = text;
+      return { message_id: 1 };
+    };
+
+    await bridge.handleCommand('/fast');
+
+    assert.equal(bridge.isFastModeEnabled(), true);
+    assert.match(sentText, /Fast mode enabled/);
+    assert.deepEqual(config.codexArgs, ['--dangerously-bypass-approvals-and-sandbox', '-c', 'reasoning_effort="low"']);
+    assert.deepEqual(config.getWorkspace(tmpDir).codexArgs, ['--dangerously-bypass-approvals-and-sandbox', '-c', 'reasoning_effort="low"']);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('handleCommand /fast off disables fast Codex mode and removes reasoning override', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    bridge.providerArgs = ['--dangerously-bypass-approvals-and-sandbox', '-c', 'reasoning_effort="low"'];
+    config.setMany({ codexArgs: [...bridge.providerArgs] });
+    config.setWorkspace(tmpDir, { codexArgs: [...bridge.providerArgs] });
+
+    let sentText = null;
+    bridge.safeSendMessage = async text => {
+      sentText = text;
+      return { message_id: 1 };
+    };
+
+    await bridge.handleCommand('/fast off');
+
+    assert.equal(bridge.isFastModeEnabled(), false);
+    assert.match(sentText, /Fast mode disabled/);
+    assert.deepEqual(config.codexArgs, ['--dangerously-bypass-approvals-and-sandbox']);
+    assert.deepEqual(config.getWorkspace(tmpDir).codexArgs, ['--dangerously-bypass-approvals-and-sandbox']);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('local /reset clears config and stops the bridge', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
@@ -1837,6 +1890,7 @@ test('connectToken registers Telegram bot commands during initialization', async
       registeredCommands.map(command => command.command),
       [
         'help',
+        'fast',
         'keyboard',
         'menu',
         'status',
