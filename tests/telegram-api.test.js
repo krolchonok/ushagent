@@ -97,6 +97,41 @@ test('setMyCommands passes normalized commands to Telegram', async () => {
   ]);
 });
 
+test('setMyName passes normalized bot name to Telegram', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  let request = null;
+  api.bot = {
+    setMyName: async name => {
+      request = name;
+      return true;
+    },
+  };
+
+  await api.setMyName('  host-name  ');
+
+  assert.equal(request, 'host-name');
+});
+
+test('setChatMemberTag delegates to Telegram bot API request', async () => {
+  const api = new TelegramApi('123456:token_token_token_token');
+  let request = null;
+  api.bot = {
+    _request: async (method, options) => {
+      request = { method, options };
+      return true;
+    },
+  };
+
+  await api.setChatMemberTag('-1001', '42', 'dev');
+
+  assert.equal(request.method, 'setChatMemberTag');
+  assert.deepEqual(request.options.form, {
+    chat_id: '-1001',
+    user_id: '42',
+    tag: 'dev',
+  });
+});
+
 test('createForumTopic delegates to Telegram bot API', async () => {
   const api = new TelegramApi('123456:token_token_token_token');
   let request = null;

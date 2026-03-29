@@ -1498,6 +1498,33 @@ test('handleCommand /fast off disables fast Codex mode and removes reasoning ove
   }
 });
 
+test('ensureTelegramChatMemberTag sets the bot member tag to the hostname', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge } = createBridge(tmpDir);
+    let tagRequest = null;
+    bridge.telegram = {
+      setChatMemberTag: async (chatId, userId, tag) => {
+        tagRequest = { chatId, userId, tag };
+      },
+    };
+    bridge.config.setMany({ telegramBotId: '42' });
+
+    await bridge.ensureTelegramChatMemberTag('-1001');
+
+    assert.deepEqual(tagRequest, {
+      chatId: '-1001',
+      userId: '42',
+      tag: os.hostname().slice(0, 32),
+    });
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
 test('local /reset clears config and stops the bridge', async () => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
@@ -1870,14 +1897,19 @@ test('connectToken registers Telegram bot commands during initialization', async
 
   const originalEnsurePollingMode = TelegramApi.prototype.ensurePollingMode;
   const originalGetMe = TelegramApi.prototype.getMe;
+  const originalSetMyName = TelegramApi.prototype.setMyName;
   const originalSetMyCommands = TelegramApi.prototype.setMyCommands;
 
   try {
     const { bridge, config } = createBridge(tmpDir);
     let registeredCommands = null;
+    let registeredName = null;
 
     TelegramApi.prototype.ensurePollingMode = async () => {};
     TelegramApi.prototype.getMe = async () => ({ id: 999, username: 'freshbot' });
+    TelegramApi.prototype.setMyName = async name => {
+      registeredName = name;
+    };
     TelegramApi.prototype.setMyCommands = async commands => {
       registeredCommands = commands;
     };
@@ -1907,10 +1939,12 @@ test('connectToken registers Telegram bot commands during initialization', async
         'stop',
       ]
     );
+    assert.equal(registeredName, os.hostname());
     assert.equal(config.telegramBotUsername, 'freshbot');
   } finally {
     TelegramApi.prototype.ensurePollingMode = originalEnsurePollingMode;
     TelegramApi.prototype.getMe = originalGetMe;
+    TelegramApi.prototype.setMyName = originalSetMyName;
     TelegramApi.prototype.setMyCommands = originalSetMyCommands;
     process.chdir(previousCwd);
   }

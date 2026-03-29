@@ -470,6 +470,7 @@ class Bridge {
       }
       this.prepareStartupSession();
       this.persistWorkspaceState();
+      await this.ensureTelegramChatMemberTag(pairing.chatId);
 
       console.log(`Connected to Telegram chat ${pairing.chatId}.`);
       console.log(`UshAgent is running in ${this.provider} mode. Send /help in Telegram.\n`);
@@ -841,6 +842,29 @@ class Bridge {
       codexArgs: effectiveArgs,
     });
     this.persistWorkspaceState();
+  }
+
+  getDesiredChatMemberTag() {
+    return String(os.hostname() || '')
+      .trim()
+      .slice(0, 32);
+  }
+
+  async ensureTelegramChatMemberTag(chatId = this.config.telegramChatId) {
+    const targetChatId = String(chatId || '').trim();
+    const botUserId = String(this.config.telegramBotId || '').trim();
+    const desiredTag = this.getDesiredChatMemberTag();
+    if (!targetChatId || !botUserId || !desiredTag || !this.telegram) {
+      return;
+    }
+
+    try {
+      await this.telegram.setChatMemberTag(targetChatId, botUserId, desiredTag);
+      this.logger.info(`Updated Telegram chat member tag for bot ${botUserId} to ${desiredTag} in chat ${targetChatId}.`);
+    } catch (error) {
+      const reason = error?.message ? String(error.message) : String(error);
+      this.logger.warn(`Failed to update Telegram chat member tag to ${desiredTag}: ${reason}`);
+    }
   }
 
   async handleFastModeCommand(argument = '', source = 'telegram') {
@@ -2801,6 +2825,15 @@ class Bridge {
     try {
       await telegram.ensurePollingMode();
       const me = await telegram.getMe();
+      const desiredBotName = String(os.hostname() || '').trim().slice(0, 64);
+      if (desiredBotName) {
+        try {
+          await telegram.setMyName(desiredBotName);
+        } catch (error) {
+          const reason = error?.message ? String(error.message) : String(error);
+          this.logger.warn(`Failed to update Telegram bot name to ${desiredBotName}: ${reason}`);
+        }
+      }
       await telegram.setMyCommands(getTelegramBotCommands());
 
       const nextBotId = me.id === undefined || me.id === null ? null : String(me.id);
@@ -3668,7 +3701,7 @@ class Bridge {
     });
 
     if (text.startsWith('/')) {
-      await this.handleCommand(text);
+      await this.handleCommand(message);
       return;
     }
 
@@ -3806,7 +3839,9 @@ class Bridge {
   }
 
   async handleCommand(text) {
-    const parts = String(text || '')
+    const message = text && typeof text === 'object' ? text : { text };
+    const rawText = String(message?.text || '').trim();
+    const parts = rawText
       .trim()
       .split(/\s+/)
       .filter(Boolean);

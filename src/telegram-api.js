@@ -320,6 +320,47 @@ class TelegramApi {
     }
   }
 
+  async setMyName(name) {
+    const normalizedName = String(name || '').trim();
+    if (!normalizedName) {
+      throw new TelegramApiError('Missing Telegram bot name');
+    }
+
+    try {
+      await withTimeout(this.bot.setMyName(normalizedName), DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS, 'Telegram bot name update');
+    } catch (error) {
+      throw toTelegramError(error, 'Failed to update Telegram bot name');
+    }
+  }
+
+  async setChatMemberTag(chatId, userId, tag = '') {
+    const targetChatId = String(chatId || '').trim();
+    const targetUserId = String(userId || '').trim();
+    const normalizedTag = String(tag || '').trim();
+    if (!targetChatId) {
+      throw new TelegramApiError('Missing Telegram chat ID');
+    }
+    if (!targetUserId) {
+      throw new TelegramApiError('Missing Telegram user ID');
+    }
+
+    try {
+      await withTimeout(
+        this.bot._request('setChatMemberTag', {
+          form: {
+            chat_id: targetChatId,
+            user_id: targetUserId,
+            tag: normalizedTag,
+          },
+        }),
+        DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS,
+        'Telegram chat member tag update'
+      );
+    } catch (error) {
+      throw toTelegramError(error, 'Failed to update Telegram chat member tag');
+    }
+  }
+
   async getChat(chatId) {
     const targetChatId = String(chatId || '').trim();
     if (!targetChatId) {
