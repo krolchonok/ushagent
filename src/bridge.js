@@ -68,6 +68,25 @@ function sanitizeTopicSegment(value, fallback = 'unknown') {
   return normalized || fallback;
 }
 
+function formatTelegramBotTitle(value, fallback = 'UshAgent') {
+  const normalized = String(value || '')
+    .trim()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 64);
+  return normalized || fallback;
+}
+
+function formatTelegramChatMemberTag(value, fallback = 'ushagent') {
+  const normalized = String(value || '')
+    .trim()
+    .replace(/[^a-z0-9]+/gi, '')
+    .toLowerCase()
+    .slice(0, 10);
+  return normalized || fallback;
+}
+
 function getHostTopicKey(hostname = os.hostname()) {
   return `host:${String(hostname || '')
     .trim()
@@ -845,9 +864,7 @@ class Bridge {
   }
 
   getDesiredChatMemberTag() {
-    return String(os.hostname() || '')
-      .trim()
-      .slice(0, 32);
+    return formatTelegramChatMemberTag(os.hostname());
   }
 
   async ensureTelegramChatMemberTag(chatId = this.config.telegramChatId) {
@@ -2825,7 +2842,7 @@ class Bridge {
     try {
       await telegram.ensurePollingMode();
       const me = await telegram.getMe();
-      const desiredBotName = String(os.hostname() || '').trim().slice(0, 64);
+      const desiredBotName = formatTelegramBotTitle(os.hostname());
       if (desiredBotName) {
         try {
           await telegram.setMyName(desiredBotName);

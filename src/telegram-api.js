@@ -327,7 +327,15 @@ class TelegramApi {
     }
 
     try {
-      await withTimeout(this.bot.setMyName(normalizedName), DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS, 'Telegram bot name update');
+      await withTimeout(
+        this.bot._request('setMyName', {
+          form: {
+            name: normalizedName,
+          },
+        }),
+        DEFAULT_TELEGRAM_REQUEST_TIMEOUT_MS,
+        'Telegram bot name update'
+      );
     } catch (error) {
       throw toTelegramError(error, 'Failed to update Telegram bot name');
     }

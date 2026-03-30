@@ -1502,10 +1502,12 @@ test('ensureTelegramChatMemberTag sets the bot member tag to the hostname', asyn
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
   const previousCwd = process.cwd();
   process.chdir(tmpDir);
+  const originalHostname = os.hostname;
 
   try {
     const { bridge } = createBridge(tmpDir);
     let tagRequest = null;
+    os.hostname = () => 'krol-Default-string';
     bridge.telegram = {
       setChatMemberTag: async (chatId, userId, tag) => {
         tagRequest = { chatId, userId, tag };
@@ -1518,9 +1520,10 @@ test('ensureTelegramChatMemberTag sets the bot member tag to the hostname', asyn
     assert.deepEqual(tagRequest, {
       chatId: '-1001',
       userId: '42',
-      tag: os.hostname().slice(0, 32),
+      tag: 'kroldefaul',
     });
   } finally {
+    os.hostname = originalHostname;
     process.chdir(previousCwd);
   }
 });
@@ -1899,12 +1902,14 @@ test('connectToken registers Telegram bot commands during initialization', async
   const originalGetMe = TelegramApi.prototype.getMe;
   const originalSetMyName = TelegramApi.prototype.setMyName;
   const originalSetMyCommands = TelegramApi.prototype.setMyCommands;
+  const originalHostname = os.hostname;
 
   try {
     const { bridge, config } = createBridge(tmpDir);
     let registeredCommands = null;
     let registeredName = null;
 
+    os.hostname = () => 'DESKTOP-GEEPF7T';
     TelegramApi.prototype.ensurePollingMode = async () => {};
     TelegramApi.prototype.getMe = async () => ({ id: 999, username: 'freshbot' });
     TelegramApi.prototype.setMyName = async name => {
@@ -1939,13 +1944,14 @@ test('connectToken registers Telegram bot commands during initialization', async
         'stop',
       ]
     );
-    assert.equal(registeredName, os.hostname());
+    assert.equal(registeredName, 'DESKTOP GEEPF7T');
     assert.equal(config.telegramBotUsername, 'freshbot');
   } finally {
     TelegramApi.prototype.ensurePollingMode = originalEnsurePollingMode;
     TelegramApi.prototype.getMe = originalGetMe;
     TelegramApi.prototype.setMyName = originalSetMyName;
     TelegramApi.prototype.setMyCommands = originalSetMyCommands;
+    os.hostname = originalHostname;
     process.chdir(previousCwd);
   }
 });

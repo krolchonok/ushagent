@@ -101,15 +101,16 @@ test('setMyName passes normalized bot name to Telegram', async () => {
   const api = new TelegramApi('123456:token_token_token_token');
   let request = null;
   api.bot = {
-    setMyName: async name => {
-      request = name;
+    _request: async (method, options) => {
+      request = { method, options };
       return true;
     },
   };
 
   await api.setMyName('  host-name  ');
 
-  assert.equal(request, 'host-name');
+  assert.equal(request.method, 'setMyName');
+  assert.equal(request.options.form.name, 'host-name');
 });
 
 test('setChatMemberTag delegates to Telegram bot API request', async () => {
