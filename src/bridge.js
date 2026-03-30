@@ -1273,6 +1273,16 @@ class Bridge {
     return this.mergeReplyMarkup({ inline_keyboard }, this.getReplyMarkupForThread(messageThreadId));
   }
 
+  buildProgressReplyMarkup(messageThreadId = null) {
+    if (!Number.isInteger(messageThreadId)) {
+      return null;
+    }
+
+    return {
+      inline_keyboard: [[{ text: 'Stop Task', callback_data: `stop_execution:${messageThreadId}` }]],
+    };
+  }
+
   async syncReplyKeyboard(messageThreadId = null, options = {}) {
     const text = String(options.text || '').trim() || 'Reply keyboard updated.';
     const replyMarkup = options.remove === true ? this.buildReplyKeyboardRemoval() : this.buildPersistentReplyKeyboard();
@@ -3263,6 +3273,7 @@ class Bridge {
       const abortController = new globalThis.AbortController();
       const groupedCount = Number.isFinite(options.groupedCount) ? Math.max(1, Number(options.groupedCount)) : 1;
       const sourceThreadId = context.sourceThreadId;
+      const progressReplyMarkup = source === 'telegram' ? this.buildProgressReplyMarkup(sourceThreadId) : null;
       let lastProgressText = '';
       let progressChain = Promise.resolve();
       let progressMessageId = null;
@@ -3294,6 +3305,7 @@ class Bridge {
               );
               await this.telegram.editMessageText(this.config.telegramChatId, progressMessageId, nextProgressText, {
                 messageThreadId: sourceThreadId,
+                replyMarkup: progressReplyMarkup,
               });
               this.logger.info(`Edited Telegram progress message ${progressMessageId} successfully.`);
             } catch (error) {
@@ -3340,6 +3352,7 @@ class Bridge {
           const progressMessage = await this.safeSendMessage(progressMessageText, {
             messageThreadId: sourceThreadId,
             silent: true,
+            replyMarkup: progressReplyMarkup,
           });
           if (Number.isInteger(progressMessage?.message_id)) {
             progressMessageId = progressMessage.message_id;

@@ -939,9 +939,15 @@ test('queuePrompt keeps progress and final response in the original Telegram top
     await bridge.queuePrompt('hello', 'telegram', { messageThreadId: 30 });
 
     assert.equal(sent[0].options.messageThreadId, 30);
+    assert.deepEqual(sent[0].options.replyMarkup, {
+      inline_keyboard: [[{ text: 'Stop Task', callback_data: 'stop_execution:30' }]],
+    });
     assert.equal(sent[1].options.messageThreadId, 30);
     assert.equal(edits.length, 1);
     assert.equal(edits[0].options.messageThreadId, 30);
+    assert.deepEqual(edits[0].options.replyMarkup, {
+      inline_keyboard: [[{ text: 'Stop Task', callback_data: 'stop_execution:30' }]],
+    });
     assert.equal(bridge.telegramThreadId, 77);
   } finally {
     process.chdir(previousCwd);
