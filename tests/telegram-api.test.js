@@ -3,9 +3,10 @@ import test from 'node:test';
 import { TelegramApi, formatTelegramHtml } from '../src/telegram-api.js';
 
 test('formatTelegramHtml converts inline and fenced code to Telegram HTML', () => {
-  const formatted = formatTelegramHtml(['Use `npm install` first.', '', '```js', 'console.log("ok");', '```'].join('\n'));
+  const formatted = formatTelegramHtml(['Use `npm install` first and **read notes**.', '', '```js', 'console.log("ok");', '```'].join('\n'));
 
-  assert.match(formatted, /Use <code>npm install<\/code> first\./);
+  assert.match(formatted, /Use <code>npm install<\/code> first and <b>read notes<\/b>\./);
+  assert.match(formatted, /<b>read notes<\/b>/);
   assert.match(formatted, /<pre><code class="language-js">console\.log\("ok"\);\n<\/code><\/pre>/);
 });
 

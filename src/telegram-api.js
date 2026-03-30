@@ -48,7 +48,9 @@ function escapeHtml(text) {
 }
 
 function formatInlineCode(text) {
-  return escapeHtml(text).replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  return escapeHtml(text)
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^\n*][^*\n]*?)\*\*/g, '<b>$1</b>');
 }
 
 function formatTelegramHtml(text) {

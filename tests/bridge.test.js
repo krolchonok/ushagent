@@ -1633,7 +1633,7 @@ test('runPairingFlow supports forum pairing from a supergroup topic chat', async
 
     assert.equal(pairing.chatId, '-1001');
     assert.equal(config.telegramChatId, '-1001');
-    assert.equal(config.telegramChatUserId, null);
+    assert.equal(config.telegramChatUserId, 'user-1');
     assert.equal(config.telegramUpdateCursor, 2);
     assert.equal(sent.chatId, '-1001');
     assert.match(sent.text, /forum mode/i);
@@ -1702,6 +1702,64 @@ test('runPairingFlow ignores forum commands addressed to another bot', async () 
     assert.equal(pairing.chatId, '-1001');
     assert.equal(updateCall, 2);
     assert.equal(config.telegramChatId, '-1001');
+    assert.equal(config.telegramChatUserId, 'user-1');
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test('pollOnce ignores forum messages from users other than the paired user', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'ushagent-test-'));
+  const previousCwd = process.cwd();
+  process.chdir(tmpDir);
+
+  try {
+    const { bridge, config } = createBridge(tmpDir);
+    bridge.running = true;
+    config.setMany({
+      telegramChatId: '-1001',
+      telegramChatUserId: 'owner-1',
+      telegramUpdateCursor: 0,
+      telegramBotUsername: 'forumbot',
+    });
+    bridge.telegramForumState = {
+      enabled: true,
+      chatId: '-1001',
+      mainThreadId: null,
+      hostThreadId: 1218,
+      topics: {
+        'host:test-host': {
+          threadId: 1218,
+          title: 'HOST: test-host',
+          kind: 'host',
+          hostname: 'test-host',
+        },
+      },
+    };
+
+    let handled = false;
+    bridge.handleMessage = async () => {
+      handled = true;
+    };
+    bridge.telegram = {
+      getUpdates: async () => ({
+        nextCursor: 10,
+        messages: [
+          {
+            chatId: '-1001',
+            chatType: 'supergroup',
+            userId: 'intruder-2',
+            messageThreadId: 1218,
+            text: '/help@forumbot',
+          },
+        ],
+      }),
+    };
+
+    await bridge.pollOnce();
+
+    assert.equal(handled, false);
+    assert.equal(config.telegramUpdateCursor, 10);
   } finally {
     process.chdir(previousCwd);
   }

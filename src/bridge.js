@@ -3556,7 +3556,7 @@ class Bridge {
 
           this.config.setMany({
             telegramChatId: message.chatId,
-            telegramChatUserId: null,
+            telegramChatUserId: message.userId || null,
           });
 
           if (onStatus) {
